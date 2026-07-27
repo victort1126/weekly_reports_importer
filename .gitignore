@@ -1,0 +1,17 @@
+# Environment / secrets
+.env
+credentials/
+token.json
+secrets.properties
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

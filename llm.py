@@ -1,0 +1,228 @@
+"""Azure OpenAI (GPT-5) structured extraction of weekly reports."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from openai import AzureOpenAI
+
+from config import config
+from models import EmployeeMatch, RosterEntry, WeeklyReport
+
+logger = logging.getLogger(__name__)
+
+_SYSTEM_PROMPT = """You are an assistant that extracts structured data from an employee's \
+weekly work report. The report text below was forwarded from a Slack DM, so it may include \
+forwarding headers, timestamps, or the employee's own name/signature.
+
+Extract exactly these fields:
+- employee_name: the report author's full name.
+- team: the employee's team or product, if mentioned.
+- iso_year_week: the ISO 8601 year-week the report covers, formatted 'YYYY-Www' (e.g. \
+'2026-W30'). Prefer a week explicitly stated in the report. If none is stated, use the \
+provided message date to compute it.
+- tasks_completed: what the employee achieved/completed this week.
+- next_steps: what the employee plans to do next week. Leave blank if not stated.
+- blockers_risks: blockers or risks encountered. Leave blank if not stated.
+- needs_from_others: anything needed from other team members. Leave blank if not stated.
+- demo_links: any demo URLs or screenshot links/references mentioned. Leave blank if none.
+
+Do not invent information that isn't present in the report or supplied context.
+
+IMPORTANT: Do not translate anything. Keep every field (including employee_name, team, \
+and all free-text fields) in the exact original language/script the report was written \
+in. Never convert the text into English or any other language.
+
+IMPORTANT: Do not summarize, condense, or rewrite the report's wording. For the free-text \
+fields (tasks_completed, next_steps, blockers_risks, needs_from_others, demo_links), copy \
+the relevant original sentences/lines verbatim (light cleanup of stray forwarding artifacts \
+is fine) and PRESERVE the original formatting:
+- Keep line breaks between separate lines, bullet points, and paragraphs using '\\n' -- do \
+not merge multiple lines/bullets into a single run-on paragraph or sentence.
+- Keep bullet/numbering markers (e.g. '-', '*', '1.') and section titles/headers exactly as \
+written.
+- Only place text under the field it actually belongs to; e.g. if the report has separate \
+'This week' / 'Next week' sections, split their content into tasks_completed / next_steps \
+respectively rather than repeating the whole report in one field."""
+
+
+_MATCH_SYSTEM_PROMPT = """You match an employee name extracted from a Slack weekly report \
+to the correct entry in a company roster.
+
+The candidate name may be a Slack display name/handle rather than a full legal name, so it \
+can be:
+- Missing a surname, middle name, or alias (e.g. "Jane" for roster entry "Jane Doe").
+- A nickname or shortened form of a roster name.
+- Written in a different script or regional variant than the roster (e.g. Traditional vs \
+Simplified Chinese characters for the same name).
+- Slightly misspelled or differently romanized.
+
+Rules:
+- Only ever return a name that appears verbatim (character-for-character) in the provided \
+roster list.
+- If exactly one roster entry plausibly refers to the same person as the candidate, return it.
+- If several roster entries could plausibly match, use any team/location context provided to \
+pick the single most likely one.
+- If no roster entry is a plausible match for the same person, return null. Do not guess."""
+
+
+class ReportExtractionError(RuntimeError):
+    """Raised when the LLM fails to produce a valid WeeklyReport."""
+
+
+_client: AzureOpenAI | None = None
+
+
+def _get_client() -> AzureOpenAI:
+    global _client
+    if _client is None:
+        _client = AzureOpenAI(
+            azure_endpoint=config.azure_openai_endpoint,
+            api_key=config.azure_openai_api_key,
+            api_version=config.azure_openai_api_version,
+        )
+    return _client
+
+
+def _build_user_prompt(report_text: str, message_date: datetime) -> str:
+    return (
+        "Message date (for ISO week inference if needed): "
+        f"{message_date.date().isoformat()}\n\n"
+        f"--- Report text ---\n{report_text.strip()}"
+    )
+
+
+class ReportExtractor:
+    """Thin wrapper around the Azure OpenAI structured-output extraction call."""
+
+    def __init__(self) -> None:
+        self._client = _get_client()
+
+    def extract(
+        self, report_text: str, message_date: datetime | None = None
+    ) -> WeeklyReport:
+        if not report_text or not report_text.strip():
+            raise ReportExtractionError("Report text is empty; nothing to extract.")
+
+        message_date = message_date or datetime.now(timezone.utc)
+
+        try:
+            completion = self._client.chat.completions.parse(
+                model=config.azure_openai_deployment,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": _build_user_prompt(report_text, message_date),
+                    },
+                ],
+                response_format=WeeklyReport,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface all failures uniformly
+            logger.exception("Azure OpenAI extraction call failed")
+            raise ReportExtractionError(f"LLM call failed: {exc}") from exc
+
+        choice = completion.choices[0]
+        if choice.message.refusal:
+            raise ReportExtractionError(
+                f"LLM refused to extract report: {choice.message.refusal}"
+            )
+
+        parsed = choice.message.parsed
+        if parsed is None:
+            raise ReportExtractionError("LLM did not return a parsed structured result.")
+
+        return parsed
+
+
+_extractor: ReportExtractor | None = None
+
+
+def get_extractor() -> ReportExtractor:
+    global _extractor
+    if _extractor is None:
+        _extractor = ReportExtractor()
+    return _extractor
+
+
+def extract_report(
+    report_text: str, message_date: datetime | None = None
+) -> WeeklyReport:
+    """Convenience wrapper around a lazily-created module-level ReportExtractor."""
+    return get_extractor().extract(report_text, message_date)
+
+
+def _format_roster_line(entry: RosterEntry) -> str:
+    details = ", ".join(
+        bit
+        for bit in [
+            f"Team: {entry.team}" if entry.team else "",
+            f"Location: {entry.location}" if entry.location else "",
+        ]
+        if bit
+    )
+    return f"- {entry.name}" + (f" ({details})" if details else "")
+
+
+def match_employee_name(
+    candidate_name: str,
+    roster: list[RosterEntry],
+    hint_team: str | None = None,
+) -> str | None:
+    """Ask the LLM to pick the roster entry that best matches `candidate_name`.
+
+    Handles cases plain string similarity misses: partial names/aliases (e.g. a
+    Slack handle missing the surname) and script/regional variants (e.g.
+    Traditional vs Simplified Chinese). Returns the matched name exactly as it
+    appears in `roster`, or None if no entry is a plausible match (or the call
+    fails for any reason -- callers should treat this the same as "no match").
+    """
+    candidate_name = (candidate_name or "").strip()
+    if not candidate_name or not roster:
+        return None
+
+    roster_list_text = "\n".join(_format_roster_line(entry) for entry in roster)
+    user_content = f"Candidate name (from a Slack message): {candidate_name}"
+    if hint_team:
+        user_content += (
+            f"\nTeam mentioned in the report (may help disambiguate, may be "
+            f"inaccurate): {hint_team}"
+        )
+    user_content += f"\n\nRoster:\n{roster_list_text}"
+
+    try:
+        completion = _get_client().chat.completions.parse(
+            model=config.azure_openai_deployment,
+            messages=[
+                {"role": "system", "content": _MATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            response_format=EmployeeMatch,
+        )
+    except Exception:  # noqa: BLE001 - matching is best-effort, never fatal
+        logger.exception("LLM employee-name matching call failed")
+        return None
+
+    choice = completion.choices[0]
+    if choice.message.refusal or choice.message.parsed is None:
+        return None
+
+    matched = choice.message.parsed.matched_name
+    if not matched:
+        return None
+
+    for entry in roster:
+        if entry.name.strip().lower() == matched.strip().lower():
+            logger.info(
+                "LLM-matched employee '%s' to roster entry '%s' (%s)",
+                candidate_name,
+                entry.name,
+                choice.message.parsed.reasoning,
+            )
+            return entry.name
+
+    logger.warning(
+        "LLM returned a matched_name not present in the roster: %r", matched
+    )
+    return None
