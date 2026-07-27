@@ -22,6 +22,27 @@ from models import WeeklyReport
 
 
 class AppPipelineTests(unittest.TestCase):
+    def test_one_zip_attachment_becomes_multiple_sources(self) -> None:
+        event = {
+            "type": "message",
+            "files": [
+                {
+                    "name": "team-weeklies.zip",
+                    "url_private_download": "https://files.slack.test/team.zip",
+                }
+            ],
+        }
+        zip_sources = [
+            IngestedFile(name="team-weeklies.zip / Jane.xlsx", text="Jane"),
+            IngestedFile(name="team-weeklies.zip / John.xlsx", text="John"),
+        ]
+
+        with patch("app.ingest_slack_files", return_value=zip_sources):
+            sources, errors = app._load_report_sources(event, MagicMock())
+
+        self.assertEqual(sources, zip_sources)
+        self.assertEqual(errors, [])
+
     def test_one_workbook_source_appends_every_extracted_employee(self) -> None:
         reports = [
             WeeklyReport(

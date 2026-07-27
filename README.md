@@ -11,8 +11,8 @@ result to a "Report Log" tab.
    upload an Excel workbook containing several employees' reports into a
    private Slack channel.
 2. The app receives the message over Socket Mode. It extracts forwarded text,
-   downloads `.md`/`.xlsx` attachments, and converts workbook worksheets into
-   structured text while preserving rows and columns.
+   downloads `.md`/`.xlsx`/`.zip` attachments, and converts workbook
+   worksheets into structured text while preserving rows and columns.
 3. Azure OpenAI (GPT-5) extracts structured fields (employee name, team, ISO
    week, tasks completed, next steps, blockers/risks, needs from others, demo
    links) as strict JSON. Bundled workbooks produce one report per employee.
@@ -134,12 +134,17 @@ test it end-to-end; the bot will reply in-thread with the parsed result.
 - `.xlsx` Excel workbooks (the common misspelling `.xslx` is also accepted).
   Every non-empty worksheet is read, and GPT returns one separate report per
   employee found across the workbook.
+- `.zip` bundles containing separate `.xlsx`/`.xslx` workbooks (and optionally
+  Markdown files). Each supported file inside the archive becomes an
+  independent extraction source; folders and unrelated files are ignored.
 - Images and other non-report attachments remain demo/screenshot links.
 
 Report files are limited to 15 MB, 50,000 populated workbook cells, and
 250,000 extracted characters to prevent accidentally sending an excessively
 large workbook to the LLM. Legacy binary `.xls` files are not supported; save
-them as `.xlsx` first.
+them as `.xlsx` first. ZIP archives are read entirely in memory (nothing is
+extracted to disk) and are limited to 100 entries, 15 MB per contained report,
+and 50 MB total uncompressed report data. Encrypted archives are not supported.
 
 ### Windows: double-click launcher
 
@@ -165,7 +170,8 @@ Closing the window stops the app.
 - `config.py` - loads and validates all configuration from `.env`
 - `models.py` - `WeeklyReport` pydantic schema (the canonical extraction shape)
 - `llm.py` - Azure OpenAI client + single/batch structured-output extraction
-- `file_ingest.py` - securely downloads and parses Slack `.md`/`.xlsx` files
+- `file_ingest.py` - securely downloads and parses Slack `.md`, `.xlsx`, and
+  ZIP report bundles
 - `text_cleanup.py` - removes emojis without changing wording or line breaks
 - `markdown_format.py` - converts markdown/mrkdwn (`*bold*`, `_italic_`, `# Heading`, ...)
   into plain text + Google Sheets rich-text formatting

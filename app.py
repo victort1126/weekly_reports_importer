@@ -17,7 +17,7 @@ from config import config
 from file_ingest import (
     FileIngestionError,
     IngestedFile,
-    ingest_slack_file,
+    ingest_slack_files,
     is_supported_report_file,
 )
 from llm import ReportExtractionError, extract_reports
@@ -94,24 +94,32 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
                 continue
 
         try:
-            ingested = ingest_slack_file(file_metadata, config.slack_bot_token)
+            ingested_files = ingest_slack_files(
+                file_metadata, config.slack_bot_token
+            )
         except FileIngestionError as exc:
             logger.warning("Attachment '%s' failed: %s", file_label, exc)
             errors.append(str(exc))
             continue
 
         logger.info(
-            "Attachment '%s' ready for extraction (%s chars)",
-            ingested.name,
-            len(ingested.text),
+            "Attachment '%s' produced %d extraction source(s)",
+            file_label,
+            len(ingested_files),
         )
-        content = ingested.text
-        if message_text:
-            content = (
-                f"Slack message context:\n{message_text}\n\n"
-                f"Attached file content:\n{content}"
+        for ingested in ingested_files:
+            logger.info(
+                "Source '%s' ready for extraction (%s chars)",
+                ingested.name,
+                len(ingested.text),
             )
-        sources.append(IngestedFile(name=ingested.name, text=content))
+            content = ingested.text
+            if message_text:
+                content = (
+                    f"Slack message context:\n{message_text}\n\n"
+                    f"Attached file content:\n{content}"
+                )
+            sources.append(IngestedFile(name=ingested.name, text=content))
 
     # For file-based submissions, the message text is context for the file,
     # not a second report. Ordinary forwarded/pasted messages remain one source.

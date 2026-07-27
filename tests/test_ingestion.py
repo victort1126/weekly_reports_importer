@@ -3,10 +3,16 @@ from __future__ import annotations
 import unittest
 from io import BytesIO
 from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 
-from file_ingest import ingest_slack_file, is_supported_report_file
+from file_ingest import (
+    FileIngestionError,
+    ingest_slack_file,
+    ingest_slack_files,
+    is_supported_report_file,
+)
 from markdown_format import convert_markdown
 from models import EnrichedReport, ReportBatch, WeeklyReport
 
@@ -25,6 +31,17 @@ class _Response:
 
 
 class IngestionTests(unittest.TestCase):
+    @staticmethod
+    def _workbook_bytes(name: str, task: str) -> bytes:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["Name", "Completed"])
+        sheet.append([name, task])
+        buffer = BytesIO()
+        workbook.save(buffer)
+        workbook.close()
+        return buffer.getvalue()
+
     def test_emojis_are_removed_but_markdown_and_lines_remain(self) -> None:
         report = WeeklyReport(
             employee_name="Jane 👩‍💻",
@@ -91,6 +108,64 @@ class IngestionTests(unittest.TestCase):
 
     def test_common_xslx_filename_typo_is_accepted(self) -> None:
         self.assertTrue(is_supported_report_file({"name": "bundle.xslx"}))
+
+    def test_zip_bundle_produces_one_source_per_workbook(self) -> None:
+        archive_buffer = BytesIO()
+        with ZipFile(archive_buffer, "w", ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "Platform/Jane Doe.xlsx",
+                self._workbook_bytes("Jane Doe", "Feature A"),
+            )
+            archive.writestr(
+                "Growth/John Smith.xslx",
+                self._workbook_bytes("John Smith", "Campaign A"),
+            )
+            archive.writestr("__MACOSX/._junk", b"ignored")
+            archive.writestr("notes.txt", b"ignored")
+
+        file = {
+            "name": "team-weeklies.zip",
+            "url_private_download": "https://files.slack.test/team-weeklies.zip",
+        }
+        with patch(
+            "file_ingest.requests.get",
+            return_value=_Response(archive_buffer.getvalue()),
+        ):
+            results = ingest_slack_files(file, "xoxb-test")
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            [result.name for result in results],
+            [
+                "team-weeklies.zip / Platform/Jane Doe.xlsx",
+                "team-weeklies.zip / Growth/John Smith.xslx",
+            ],
+        )
+        self.assertIn("Jane Doe\tFeature A", results[0].text)
+        self.assertIn("John Smith\tCampaign A", results[1].text)
+
+    def test_zip_with_no_supported_reports_is_rejected(self) -> None:
+        archive_buffer = BytesIO()
+        with ZipFile(archive_buffer, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("readme.txt", b"nothing to import")
+
+        file = {
+            "name": "empty.zip",
+            "url_private_download": "https://files.slack.test/empty.zip",
+        }
+        with (
+            patch(
+                "file_ingest.requests.get",
+                return_value=_Response(archive_buffer.getvalue()),
+            ),
+            self.assertRaisesRegex(
+                FileIngestionError, "contains no supported"
+            ),
+        ):
+            ingest_slack_files(file, "xoxb-test")
+
+    def test_zip_is_recognized_as_supported(self) -> None:
+        self.assertTrue(is_supported_report_file({"name": "team-weeklies.zip"}))
 
     def test_report_batch_keeps_employees_separate(self) -> None:
         batch = ReportBatch(
