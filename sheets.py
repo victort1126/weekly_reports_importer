@@ -62,12 +62,15 @@ def _load_credentials() -> Credentials:
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
 
     if creds and creds.valid:
+        logger.info("Google Sheets auth: using saved token (%s)", token_path)
         return creds
 
     if creds and creds.expired and creds.refresh_token:
+        logger.info("Google Sheets auth: refreshing expired token...")
         try:
             creds.refresh(Request())
             token_path.write_text(creds.to_json())
+            logger.info("Google Sheets auth: token refreshed")
             return creds
         except Exception:
             logger.warning(
@@ -83,6 +86,10 @@ def _load_credentials() -> Credentials:
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_path), SCOPES)
+    logger.info(
+        "Google Sheets auth: opening browser for OAuth consent "
+        "(this can look like the app is hanging until you finish sign-in)..."
+    )
     creds = flow.run_local_server(port=0)
 
     token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,11 +102,13 @@ class SheetsClient:
     """Wraps Roster lookups and Report Log appends against a single spreadsheet."""
 
     def __init__(self) -> None:
+        logger.info("Initializing Google Sheets client...")
         creds = _load_credentials()
         self._service = build("sheets", "v4", credentials=creds)
         self._spreadsheet_id = config.google_spreadsheet_id
         self._roster_cache: list[RosterEntry] | None = None
         self._sheet_id_cache: dict[str, int] = {}
+        logger.info("Google Sheets client ready")
 
     def _values(self):
         return self._service.spreadsheets().values()
@@ -144,7 +153,9 @@ class SheetsClient:
 
     def _roster(self, force_refresh: bool = False) -> list[RosterEntry]:
         if force_refresh or self._roster_cache is None:
+            logger.info("Loading Roster tab from Google Sheets...")
             self._roster_cache = self._fetch_roster()
+            logger.info("Roster loaded: %d entries", len(self._roster_cache))
         return self._roster_cache
 
     def lookup_employee(
@@ -228,6 +239,11 @@ class SheetsClient:
                 spans_by_column[column_offset] = spans
 
         sheet_range = f"{_quote_sheet_name(config.report_log_sheet_name)}!B:J"
+        logger.info(
+            "Appending Report Log row for %s (%s)...",
+            report.employee_name,
+            report.iso_year_week,
+        )
         try:
             append_result = (
                 self._values()
@@ -245,7 +261,14 @@ class SheetsClient:
                 f"Failed to append to the '{config.report_log_sheet_name}' tab: {exc}"
             ) from exc
 
+        updated_range = append_result.get("updates", {}).get("updatedRange", "")
+        logger.info("Report Log append OK (%s)", updated_range or "range unknown")
+
         if spans_by_column:
+            logger.info(
+                "Applying rich-text formatting to %d cell(s)...",
+                len(spans_by_column),
+            )
             try:
                 self._apply_rich_text_formatting(append_result, plain_row, spans_by_column)
             except Exception:
@@ -255,6 +278,8 @@ class SheetsClient:
                     "Saved the report, but failed to apply rich-text formatting "
                     "to it."
                 )
+            else:
+                logger.info("Rich-text formatting applied")
 
     def _apply_rich_text_formatting(
         self,

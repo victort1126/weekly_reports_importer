@@ -8,15 +8,18 @@ from datetime import datetime, timezone
 from openai import AzureOpenAI
 
 from config import config
-from models import EmployeeMatch, RosterEntry, WeeklyReport
+from models import EmployeeMatch, ReportBatch, RosterEntry, WeeklyReport
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are an assistant that extracts structured data from an employee's \
-weekly work report. The report text below was forwarded from a Slack DM, so it may include \
-forwarding headers, timestamps, or the employee's own name/signature.
+_SYSTEM_PROMPT = """You extract structured employee weekly work reports. The input may be \
+a forwarded Slack DM, a Markdown file, or a text rendering of an Excel workbook. It may \
+contain one employee report or several reports bundled together.
 
-Extract exactly these fields:
+Return exactly one report object per employee found in the input. Never combine different \
+employees into one report. Repeated worksheet/header rows are context, not employee reports.
+
+For each employee report, extract exactly these fields:
 - employee_name: the report author's full name.
 - team: the employee's team or product, if mentioned.
 - iso_year_week: the ISO 8601 year-week the report covers, formatted 'YYYY-Www' (e.g. \
@@ -29,6 +32,9 @@ provided message date to compute it.
 - demo_links: any demo URLs or screenshot links/references mentioned. Leave blank if none.
 
 Do not invent information that isn't present in the report or supplied context.
+
+Remove decorative emojis from every extracted field. Do not remove ordinary punctuation, \
+markdown markers, or meaningful non-emoji symbols.
 
 IMPORTANT: Do not translate anything. Keep every field (including employee_name, team, \
 and all free-text fields) in the exact original language/script the report was written \
@@ -99,14 +105,26 @@ class ReportExtractor:
     def __init__(self) -> None:
         self._client = _get_client()
 
-    def extract(
-        self, report_text: str, message_date: datetime | None = None
-    ) -> WeeklyReport:
+    def extract_many(
+        self,
+        report_text: str,
+        message_date: datetime | None = None,
+        source_name: str | None = None,
+    ) -> list[WeeklyReport]:
         if not report_text or not report_text.strip():
             raise ReportExtractionError("Report text is empty; nothing to extract.")
 
         message_date = message_date or datetime.now(timezone.utc)
+        user_prompt = _build_user_prompt(report_text, message_date)
+        if source_name:
+            user_prompt = f"Source file/message: {source_name}\n{user_prompt}"
 
+        logger.info(
+            "Azure OpenAI extraction request (source=%s, input=%s chars, deployment=%s)...",
+            source_name or "message",
+            len(report_text),
+            config.azure_openai_deployment,
+        )
         try:
             completion = self._client.chat.completions.parse(
                 model=config.azure_openai_deployment,
@@ -114,10 +132,10 @@ class ReportExtractor:
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": _build_user_prompt(report_text, message_date),
+                        "content": user_prompt,
                     },
                 ],
-                response_format=WeeklyReport,
+                response_format=ReportBatch,
             )
         except Exception as exc:  # noqa: BLE001 - surface all failures uniformly
             logger.exception("Azure OpenAI extraction call failed")
@@ -133,7 +151,23 @@ class ReportExtractor:
         if parsed is None:
             raise ReportExtractionError("LLM did not return a parsed structured result.")
 
-        return parsed
+        logger.info(
+            "Azure OpenAI extraction returned %d report(s) (source=%s)",
+            len(parsed.reports),
+            source_name or "message",
+        )
+        return parsed.reports
+
+    def extract(
+        self, report_text: str, message_date: datetime | None = None
+    ) -> WeeklyReport:
+        """Backward-compatible single-report extraction helper."""
+        reports = self.extract_many(report_text, message_date)
+        if len(reports) != 1:
+            raise ReportExtractionError(
+                f"Expected one report but extracted {len(reports)}."
+            )
+        return reports[0]
 
 
 _extractor: ReportExtractor | None = None
@@ -151,6 +185,15 @@ def extract_report(
 ) -> WeeklyReport:
     """Convenience wrapper around a lazily-created module-level ReportExtractor."""
     return get_extractor().extract(report_text, message_date)
+
+
+def extract_reports(
+    report_text: str,
+    message_date: datetime | None = None,
+    source_name: str | None = None,
+) -> list[WeeklyReport]:
+    """Extract all employee reports found in one message or attached file."""
+    return get_extractor().extract_many(report_text, message_date, source_name)
 
 
 def _format_roster_line(entry: RosterEntry) -> str:

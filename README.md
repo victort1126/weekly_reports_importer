@@ -7,15 +7,19 @@ result to a "Report Log" tab.
 
 ## How it works
 
-1. You forward a staff member's weekly-report DM into a private Slack channel.
-2. The app receives the message over Socket Mode, extracts the raw text and any
-   forwarded attachment text / screenshot links.
+1. You forward a staff member's weekly-report DM, upload a Markdown report, or
+   upload an Excel workbook containing several employees' reports into a
+   private Slack channel.
+2. The app receives the message over Socket Mode. It extracts forwarded text,
+   downloads `.md`/`.xlsx` attachments, and converts workbook worksheets into
+   structured text while preserving rows and columns.
 3. Azure OpenAI (GPT-5) extracts structured fields (employee name, team, ISO
    week, tasks completed, next steps, blockers/risks, needs from others, demo
-   links) as strict JSON.
+   links) as strict JSON. Bundled workbooks produce one report per employee.
 4. The app looks up the employee in the `Roster` tab of your Google Sheet and
    corrects/fills in the team (and captures email/location) from there.
-5. A new row is appended to the `Report Log` tab.
+5. Decorative emojis are removed, Markdown formatting is converted to Google
+   Sheets rich text, and one row per employee is appended to `Report Log`.
 6. The bot replies in-thread with a summary (success) or an error message
    (failure) so you get immediate feedback.
 
@@ -121,6 +125,22 @@ The app connects over Socket Mode (no public URL/firewall rule needed) and
 starts listening. Forward a report DM into the configured private channel to
 test it end-to-end; the bot will reply in-thread with the parsed result.
 
+### Supported report inputs
+
+- Forwarded or pasted Slack message text.
+- `.md` / `.markdown` files. The file is downloaded with the bot token and its
+  Markdown formatting is preserved through extraction, then rendered as rich
+  text in Google Sheets.
+- `.xlsx` Excel workbooks (the common misspelling `.xslx` is also accepted).
+  Every non-empty worksheet is read, and GPT returns one separate report per
+  employee found across the workbook.
+- Images and other non-report attachments remain demo/screenshot links.
+
+Report files are limited to 15 MB, 50,000 populated workbook cells, and
+250,000 extracted characters to prevent accidentally sending an excessively
+large workbook to the LLM. Legacy binary `.xls` files are not supported; save
+them as `.xlsx` first.
+
 ### Windows: double-click launcher
 
 `run_app.bat` lets you start the app without opening a terminal or activating
@@ -144,7 +164,9 @@ Closing the window stops the app.
 
 - `config.py` - loads and validates all configuration from `.env`
 - `models.py` - `WeeklyReport` pydantic schema (the canonical extraction shape)
-- `llm.py` - Azure OpenAI client + structured-output extraction
+- `llm.py` - Azure OpenAI client + single/batch structured-output extraction
+- `file_ingest.py` - securely downloads and parses Slack `.md`/`.xlsx` files
+- `text_cleanup.py` - removes emojis without changing wording or line breaks
 - `markdown_format.py` - converts markdown/mrkdwn (`*bold*`, `_italic_`, `# Heading`, ...)
   into plain text + Google Sheets rich-text formatting
 - `sheets.py` - Google Sheets OAuth client, Roster lookup, Report Log append (incl.
@@ -157,6 +179,8 @@ Closing the window stops the app.
 
 The LLM is instructed to preserve a report's original wording and formatting
 markers verbatim (so it won't summarize or reformat your staff's writing).
+Decorative emojis are removed deterministically after extraction, including
+from section titles, while line breaks and Markdown markers remain intact.
 Before writing to the sheet, `markdown_format.py` then converts common
 markdown/Slack-mrkdwn syntax into actual Google Sheets rich text rather than
 leaving literal markup characters in the cell:

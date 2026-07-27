@@ -6,6 +6,8 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
+from text_cleanup import remove_emojis
+
 ISO_YEAR_WEEK_RE = re.compile(r"^\d{4}-W\d{2}$")
 
 
@@ -59,6 +61,20 @@ class WeeklyReport(BaseModel):
         None, description="Demo links or screenshot references, if provided."
     )
 
+    @field_validator(
+        "employee_name",
+        "team",
+        "tasks_completed",
+        "next_steps",
+        "blockers_risks",
+        "needs_from_others",
+        "demo_links",
+        mode="before",
+    )
+    @classmethod
+    def _remove_emojis(cls, value: str | None) -> str | None:
+        return remove_emojis(value) if isinstance(value, str) else value
+
     @field_validator("iso_year_week")
     @classmethod
     def _validate_iso_year_week(cls, value: str) -> str:
@@ -81,6 +97,19 @@ class WeeklyReport(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+
+class ReportBatch(BaseModel):
+    """One or more employee reports extracted from a message or bundled workbook."""
+
+    reports: list[WeeklyReport] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "One WeeklyReport per employee found in the input. A workbook can "
+            "contain reports for several employees; do not merge them."
+        ),
+    )
 
 
 class EmployeeMatch(BaseModel):
@@ -125,6 +154,24 @@ class EnrichedReport(BaseModel):
     roster_matched: bool = False
     email: str = ""
     location: str = ""
+
+    @field_validator(
+        "iso_year_week",
+        "employee_name",
+        "team",
+        "tasks_completed",
+        "next_steps",
+        "blockers_risks",
+        "blocker_status",
+        "needs_from_others",
+        "demo_links",
+        "email",
+        "location",
+        mode="before",
+    )
+    @classmethod
+    def _remove_emojis(cls, value: str) -> str:
+        return remove_emojis(value) if isinstance(value, str) else value
 
     def to_row(self) -> list[str]:
         """Return the values for columns B..J of the 'Report Log' tab, in order."""

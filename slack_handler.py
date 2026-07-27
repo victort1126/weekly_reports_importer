@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from file_ingest import is_supported_report_file
+
 _URL_RE = re.compile(r"https?://\S+")
 
 
@@ -71,9 +73,11 @@ def _extract_attachments_text(attachments: list[dict[str, Any]]) -> str:
 
 
 def get_file_links(files: list[dict[str, Any]]) -> list[str]:
-    """Return shareable permalinks for any files/screenshots attached to the message."""
+    """Return links for non-report attachments such as screenshots/demos."""
     links: list[str] = []
     for file in files:
+        if is_supported_report_file(file):
+            continue
         link = file.get("permalink") or file.get("url_private")
         if link:
             title = file.get("title") or file.get("name") or ""
@@ -97,7 +101,11 @@ def build_report_text(event: dict[str, Any]) -> str:
     if attachments_text:
         sections.append(attachments_text)
 
-    files = event.get("files", [])
+    files = [
+        file
+        for file in event.get("files", [])
+        if not is_supported_report_file(file)
+    ]
     if files:
         file_lines = []
         for file in files:
