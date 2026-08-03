@@ -53,6 +53,11 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
 
 
+def _report_key(iso_year_week: str, employee_name: str) -> tuple[str, str]:
+    """Canonical (week, name) key used for Report Log duplicate detection."""
+    return (iso_year_week.strip().upper(), _normalize_name(employee_name))
+
+
 def _load_credentials() -> Credentials:
     token_path = Path(config.google_token_path)
     client_path = Path(config.google_oauth_client_path)
@@ -107,11 +112,49 @@ class SheetsClient:
         self._service = build("sheets", "v4", credentials=creds)
         self._spreadsheet_id = config.google_spreadsheet_id
         self._roster_cache: list[RosterEntry] | None = None
+        self._report_log_keys_cache: set[tuple[str, str]] | None = None
         self._sheet_id_cache: dict[str, int] = {}
         logger.info("Google Sheets client ready")
 
     def _values(self):
         return self._service.spreadsheets().values()
+
+    def _fetch_report_log_keys(self) -> set[tuple[str, str]]:
+        """Load existing (ISO Year-Week, Employee Name) pairs from Report Log B:C."""
+        sheet_range = f"{_quote_sheet_name(config.report_log_sheet_name)}!B2:C"
+        try:
+            result = (
+                self._values()
+                .get(spreadsheetId=self._spreadsheet_id, range=sheet_range)
+                .execute()
+            )
+        except HttpError as exc:
+            raise SheetsError(
+                f"Failed to read the '{config.report_log_sheet_name}' tab: {exc}"
+            ) from exc
+
+        keys: set[tuple[str, str]] = set()
+        for row in result.get("values", []):
+            week = row[0].strip() if len(row) > 0 and row[0] else ""
+            name = row[1].strip() if len(row) > 1 and row[1] else ""
+            if week and name:
+                keys.add(_report_key(week, name))
+        return keys
+
+    def _report_log_keys(self, force_refresh: bool = False) -> set[tuple[str, str]]:
+        if force_refresh or self._report_log_keys_cache is None:
+            logger.info("Loading existing Report Log keys for duplicate checks...")
+            self._report_log_keys_cache = self._fetch_report_log_keys()
+            logger.info(
+                "Report Log duplicate index loaded: %d existing entries",
+                len(self._report_log_keys_cache),
+            )
+        return self._report_log_keys_cache
+
+    def report_exists(self, iso_year_week: str, employee_name: str) -> bool:
+        """True if Report Log already has a row for this week + employee."""
+        key = _report_key(iso_year_week, employee_name)
+        return key in self._report_log_keys()
 
     def _fetch_roster(self) -> list[RosterEntry]:
         sheet_range = f"{_quote_sheet_name(config.roster_sheet_name)}!A2:D"
@@ -263,6 +306,12 @@ class SheetsClient:
 
         updated_range = append_result.get("updates", {}).get("updatedRange", "")
         logger.info("Report Log append OK (%s)", updated_range or "range unknown")
+
+        # Keep the in-memory duplicate index current for later reports in this run.
+        if self._report_log_keys_cache is not None:
+            self._report_log_keys_cache.add(
+                _report_key(report.iso_year_week, report.employee_name)
+            )
 
         if spans_by_column:
             logger.info(

@@ -20,7 +20,7 @@ from file_ingest import (
     ingest_slack_files,
     is_supported_report_file,
 )
-from llm import ReportExtractionError, extract_reports
+from llm import ReportExtractionError, extract_reports, get_token_usage, reset_token_usage
 from models import EnrichedReport, WeeklyReport
 from sheets import SheetsError, get_sheets_client
 from slack_handler import (
@@ -59,6 +59,13 @@ def _build_success_reply(enriched: EnrichedReport) -> str:
             "or add them to the Roster."
         )
     return "\n".join(lines)
+
+
+def _build_skip_reply(enriched: EnrichedReport) -> str:
+    return (
+        ":information_source: Skipped *{name}* ({week}) -- already present in "
+        "the *Report Log* (same ISO week + employee name)."
+    ).format(name=enriched.employee_name, week=enriched.iso_year_week)
 
 
 def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[str]]:
@@ -190,6 +197,7 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
         channel,
         thread_ts,
     )
+    reset_token_usage()
     sources, errors = _load_report_sources(event, client)
     if not sources:
         if errors:
@@ -228,16 +236,30 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
 
     replies: list[str] = []
     saved_count = 0
+    skipped_count = 0
     for source_name, weekly_report in reports:
         try:
             logger.info(
-                "Saving to Report Log: %s (%s) from '%s'...",
+                "Preparing Report Log save: %s (%s) from '%s'...",
                 weekly_report.employee_name,
                 weekly_report.iso_year_week,
                 source_name,
             )
             enriched = _enrich_report(weekly_report, file_links)
-            get_sheets_client().append_report(enriched)
+            sheets_client = get_sheets_client()
+            if sheets_client.report_exists(
+                enriched.iso_year_week, enriched.employee_name
+            ):
+                skipped_count += 1
+                logger.info(
+                    "Skipping duplicate: %s (%s) already in Report Log",
+                    enriched.employee_name,
+                    enriched.iso_year_week,
+                )
+                replies.append(_build_skip_reply(enriched))
+                continue
+
+            sheets_client.append_report(enriched)
             saved_count += 1
             logger.info(
                 "Saved row for %s (%s)",
@@ -257,14 +279,27 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
             )
 
     replies.extend(f":x: {error}" for error in errors)
+
+    usage = get_token_usage()
+    if usage.total_tokens:
+        replies.append(
+            f":receipt: Tokens used for this import: *{usage.total_tokens}* "
+            f"(prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens})"
+        )
+
     if replies:
         logger.info("Posting Slack thread reply (%d part(s))...", len(replies))
         say(text="\n\n".join(replies), thread_ts=thread_ts)
     logger.info(
-        "=== Message done (ts=%s): %d saved, %d error(s) ===",
+        "=== Message done (ts=%s): %d saved, %d skipped (duplicates), %d error(s), "
+        "%d total tokens used (prompt=%d, completion=%d) ===",
         thread_ts,
         saved_count,
+        skipped_count,
         len(errors),
+        usage.total_tokens,
+        usage.prompt_tokens,
+        usage.completion_tokens,
     )
 
 

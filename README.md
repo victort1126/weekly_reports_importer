@@ -20,8 +20,11 @@ result to a "Report Log" tab.
    corrects/fills in the team (and captures email/location) from there.
 5. Decorative emojis are removed, Markdown formatting is converted to Google
    Sheets rich text, and one row per employee is appended to `Report Log`.
+   Rows that already exist for the same ISO year-week + employee name are
+   skipped (useful for accumulative multi-week workbooks).
 6. The bot replies in-thread with a summary (success) or an error message
-   (failure) so you get immediate feedback.
+   (failure) so you get immediate feedback, including the total Azure OpenAI
+   tokens used to process that message.
 
 ## 1. Prerequisites
 
@@ -145,6 +148,20 @@ large workbook to the LLM. Legacy binary `.xls` files are not supported; save
 them as `.xlsx` first. ZIP archives are read entirely in memory (nothing is
 extracted to disk) and are limited to 100 entries, 15 MB per contained report,
 and 50 MB total uncompressed report data. Encrypted archives are not supported.
+
+### Token usage logging
+
+Every Azure OpenAI call (report extraction and LLM-assisted roster matching)
+logs its prompt/completion/total token counts to the console, e.g.:
+
+```
+INFO llm: Azure OpenAI tokens used (extraction of 'weekly.md'): prompt=812, completion=310, total=1122
+```
+
+All calls made while handling one Slack message are summed together, and the
+running total is included both in the final `=== Message done ===` log line
+and in the bot's in-thread reply (`:receipt: Tokens used for this import: ...`),
+so you can keep an eye on Azure OpenAI cost/usage per import.
 
 ### Windows: double-click launcher
 

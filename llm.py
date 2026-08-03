@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from openai import AzureOpenAI
 
@@ -11,6 +14,70 @@ from config import config
 from models import EmployeeMatch, ReportBatch, RosterEntry, WeeklyReport
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Token counts reported by an Azure OpenAI response, if any."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+    @classmethod
+    def from_completion(cls, completion: Any) -> "TokenUsage":
+        usage = getattr(completion, "usage", None)
+        if usage is None:
+            return cls()
+        return cls(
+            prompt_tokens=_coerce_int(getattr(usage, "prompt_tokens", None)),
+            completion_tokens=_coerce_int(getattr(usage, "completion_tokens", None)),
+            total_tokens=_coerce_int(getattr(usage, "total_tokens", None)),
+        )
+
+
+# Accumulates token usage across every LLM call made while processing a single
+# Slack message, so app.py can report a per-import total. Thread-local so
+# concurrently-handled messages (Bolt may dispatch events on separate threads)
+# never mix their totals.
+_usage_context = threading.local()
+
+
+def reset_token_usage() -> None:
+    """Start a fresh token-usage accumulation scope on the current thread."""
+    _usage_context.total = TokenUsage()
+
+
+def get_token_usage() -> TokenUsage:
+    """Return the token usage accumulated since the last reset_token_usage()."""
+    return getattr(_usage_context, "total", TokenUsage())
+
+
+def _record_usage(usage: TokenUsage, *, context: str) -> None:
+    logger.info(
+        "Azure OpenAI tokens used (%s): prompt=%d, completion=%d, total=%d",
+        context,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens,
+    )
+    current = getattr(_usage_context, "total", None)
+    if current is not None:
+        _usage_context.total = current + usage
 
 _SYSTEM_PROMPT = """You extract structured employee weekly work reports. The input may be \
 a forwarded Slack DM, a Markdown file, or a text rendering of an Excel workbook. It may \
@@ -141,6 +208,11 @@ class ReportExtractor:
             logger.exception("Azure OpenAI extraction call failed")
             raise ReportExtractionError(f"LLM call failed: {exc}") from exc
 
+        _record_usage(
+            TokenUsage.from_completion(completion),
+            context=f"extraction of '{source_name or 'message'}'",
+        )
+
         choice = completion.choices[0]
         if choice.message.refusal:
             raise ReportExtractionError(
@@ -246,6 +318,11 @@ def match_employee_name(
     except Exception:  # noqa: BLE001 - matching is best-effort, never fatal
         logger.exception("LLM employee-name matching call failed")
         return None
+
+    _record_usage(
+        TokenUsage.from_completion(completion),
+        context=f"employee match for '{candidate_name}'",
+    )
 
     choice = completion.choices[0]
     if choice.message.refusal or choice.message.parsed is None:
