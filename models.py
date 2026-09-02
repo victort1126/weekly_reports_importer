@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from text_cleanup import remove_emojis
 
@@ -32,7 +33,9 @@ class WeeklyReport(BaseModel):
         ...,
         description=(
             "What the employee achieved/completed this week, copied verbatim "
-            "(not summarized) with original line breaks/bullets preserved."
+            "(not summarized) with original line breaks/bullets preserved. "
+            "If a row/section has no completed-work text, omit that report "
+            "entirely instead of returning an empty string."
         ),
     )
     next_steps: str | None = Field(
@@ -107,9 +110,35 @@ class ReportBatch(BaseModel):
         min_length=1,
         description=(
             "One WeeklyReport per employee found in the input. A workbook can "
-            "contain reports for several employees; do not merge them."
+            "contain reports for several employees; do not merge them. Omit "
+            "any row that has no employee name or no completed-work text."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_incomplete_reports(cls, data: Any) -> Any:
+        """Skip rows the model returned with a blank name or tasks_completed.
+
+        Structured-output parsing used to fail the entire workbook when the
+        first report had an empty required field (common with header rows or
+        TSV-broken multiline cells). Dropping those stubs lets the remaining
+        valid reports through.
+        """
+        if not isinstance(data, dict):
+            return data
+        reports = data.get("reports")
+        if not isinstance(reports, list):
+            return data
+        kept: list[Any] = []
+        for report in reports:
+            if isinstance(report, dict):
+                name = str(report.get("employee_name") or "").strip()
+                tasks = str(report.get("tasks_completed") or "").strip()
+                if not name or not tasks:
+                    continue
+            kept.append(report)
+        return {**data, "reports": kept}
 
 
 class EmployeeMatch(BaseModel):

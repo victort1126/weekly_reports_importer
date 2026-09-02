@@ -12,6 +12,10 @@ from zipfile import BadZipFile, ZipFile
 
 import requests
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
+
+from excel_parse import ParsedWorkbook, parse_worksheet_tables
+from models import WeeklyReport
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,10 @@ class FileIngestionError(RuntimeError):
 class IngestedFile:
     name: str
     text: str
+    # Populated when an Excel table maps onto WeeklyReport columns; the pipeline
+    # then skips the LLM extraction call for this source.
+    reports: tuple[WeeklyReport, ...] = ()
+    needs_llm: bool = True
 
 
 def _file_name(file: dict[str, Any]) -> str:
@@ -121,53 +129,86 @@ def _cell_text(value: Any) -> str:
     return str(value)
 
 
-def _workbook_to_text(data: bytes, name: str) -> str:
+def _merged_value_lookup(worksheet: Worksheet) -> dict[tuple[int, int], Any]:
+    """Map every cell in a merged range to the top-left value.
+
+    MergedCell.value is read-only, so we cannot copy into the other cells.
+    Reading through this lookup makes a merged header look like a normal column.
+    """
+    lookup: dict[tuple[int, int], Any] = {}
+    for merged_range in worksheet.merged_cells.ranges:
+        value = worksheet.cell(merged_range.min_row, merged_range.min_col).value
+        if value is None:
+            continue
+        for row in range(merged_range.min_row, merged_range.max_row + 1):
+            for col in range(merged_range.min_col, merged_range.max_col + 1):
+                lookup[(row, col)] = value
+    return lookup
+
+
+def _worksheet_rows(worksheet: Worksheet) -> tuple[list[list[str]], int, int]:
+    """Return trimmed string rows plus populated cell/character counts."""
+    merged = _merged_value_lookup(worksheet)
+    rows: list[list[str]] = []
+    cell_count = 0
+    character_count = 0
+    for row in worksheet.iter_rows():
+        values = [
+            _cell_text(merged.get((cell.row, cell.column), cell.value)) for cell in row
+        ]
+        while values and not values[-1].strip():
+            values.pop()
+        if not any(value.strip() for value in values):
+            continue
+        cell_count += len(values)
+        character_count += sum(len(value) for value in values) + len(values)
+        rows.append(values)
+    return rows, cell_count, character_count
+
+
+def _parse_workbook(
+    data: bytes, name: str, message_date: datetime | None = None
+) -> ParsedWorkbook:
+    """Load an .xlsx and convert it into labeled records / structured reports."""
     try:
-        workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+        # data_only so formula cells yield computed values. Not read-only: we
+        # need merged_cells access to survive merged-header layout tweaks.
+        workbook = load_workbook(BytesIO(data), data_only=True)
     except Exception as exc:  # openpyxl exposes several format-specific exceptions
         raise FileIngestionError(f"Could not read Excel workbook '{name}': {exc}") from exc
 
-    sections: list[str] = []
+    sheets: list[tuple[str, list[list[str]]]] = []
     cell_count = 0
     character_count = 0
-
     try:
         for worksheet in workbook.worksheets:
-            rows: list[str] = []
-            for row in worksheet.iter_rows(values_only=True):
-                values = [_cell_text(value) for value in row]
-                while values and not values[-1]:
-                    values.pop()
-                if not any(value.strip() for value in values):
-                    continue
-
-                cell_count += len(values)
-                if cell_count > _MAX_WORKBOOK_CELLS:
-                    raise FileIngestionError(
-                        f"'{name}' contains too many populated cells to process safely."
-                    )
-
-                row_text = "\t".join(values)
-                character_count += len(row_text) + 1
-                if character_count > _MAX_EXTRACTED_CHARS:
-                    raise FileIngestionError(
-                        f"'{name}' contains too much text to process safely."
-                    )
-                rows.append(row_text)
-
-            if rows:
-                sections.append(
-                    f"=== Worksheet: {worksheet.title} ===\n" + "\n".join(rows)
+            rows, sheet_cells, sheet_chars = _worksheet_rows(worksheet)
+            cell_count += sheet_cells
+            character_count += sheet_chars
+            if cell_count > _MAX_WORKBOOK_CELLS:
+                raise FileIngestionError(
+                    f"'{name}' contains too many populated cells to process safely."
                 )
+            if character_count > _MAX_EXTRACTED_CHARS:
+                raise FileIngestionError(
+                    f"'{name}' contains too much text to process safely."
+                )
+            if rows:
+                sheets.append((worksheet.title, rows))
     finally:
         workbook.close()
 
-    if not sections:
+    parsed = parse_worksheet_tables(sheets, message_date=message_date)
+    if not parsed.text.strip():
         raise FileIngestionError(f"'{name}' contains no readable report data.")
-    return "\n\n".join(sections)
+    return parsed
 
 
-def _zip_to_files(data: bytes, archive_name: str) -> list[IngestedFile]:
+def _zip_to_files(
+    data: bytes,
+    archive_name: str,
+    message_date: datetime | None = None,
+) -> list[IngestedFile]:
     """Read supported report files from an archive without extracting to disk."""
     try:
         archive = ZipFile(BytesIO(data))
@@ -225,9 +266,17 @@ def _zip_to_files(data: bytes, archive_name: str) -> list[IngestedFile]:
             source_name = f"{archive_name} / {member.filename}"
             if extension in _MARKDOWN_EXTENSIONS:
                 text = _decode_markdown(member_data, source_name)
+                ingested.append(IngestedFile(name=source_name, text=text))
             else:
-                text = _workbook_to_text(member_data, source_name)
-            ingested.append(IngestedFile(name=source_name, text=text))
+                parsed = _parse_workbook(member_data, source_name, message_date)
+                ingested.append(
+                    IngestedFile(
+                        name=source_name,
+                        text=parsed.text,
+                        reports=parsed.reports,
+                        needs_llm=parsed.needs_llm,
+                    )
+                )
     finally:
         archive.close()
 
@@ -243,7 +292,9 @@ def _zip_to_files(data: bytes, archive_name: str) -> list[IngestedFile]:
 
 
 def ingest_slack_files(
-    file: dict[str, Any], slack_bot_token: str
+    file: dict[str, Any],
+    slack_bot_token: str,
+    message_date: datetime | None = None,
 ) -> list[IngestedFile]:
     """Download one Slack attachment and return one or more report sources."""
     name = _file_name(file)
@@ -257,23 +308,39 @@ def ingest_slack_files(
     data = _download(file, slack_bot_token)
     if extension in _ARCHIVE_EXTENSIONS:
         logger.info("Parsing '%s' as ZIP archive...", name)
-        return _zip_to_files(data, name)
+        return _zip_to_files(data, name, message_date)
     if extension in _MARKDOWN_EXTENSIONS:
         logger.info("Parsing '%s' as Markdown...", name)
         text = _decode_markdown(data, name)
-    else:
-        logger.info("Parsing '%s' as Excel workbook...", name)
-        text = _workbook_to_text(data, name)
+        logger.info("File '%s' parsed to %s characters", name, len(text))
+        return [IngestedFile(name=name, text=text)]
 
-    logger.info("File '%s' parsed to %s characters", name, len(text))
-    return [IngestedFile(name=name, text=text)]
+    logger.info("Parsing '%s' as Excel workbook...", name)
+    parsed = _parse_workbook(data, name, message_date)
+    logger.info(
+        "File '%s' parsed to %s characters (%d structured report(s), needs_llm=%s)",
+        name,
+        len(parsed.text),
+        len(parsed.reports),
+        parsed.needs_llm,
+    )
+    return [
+        IngestedFile(
+            name=name,
+            text=parsed.text,
+            reports=parsed.reports,
+            needs_llm=parsed.needs_llm,
+        )
+    ]
 
 
 def ingest_slack_file(
-    file: dict[str, Any], slack_bot_token: str
+    file: dict[str, Any],
+    slack_bot_token: str,
+    message_date: datetime | None = None,
 ) -> IngestedFile:
     """Backward-compatible helper for attachments that produce one source."""
-    ingested = ingest_slack_files(file, slack_bot_token)
+    ingested = ingest_slack_files(file, slack_bot_token, message_date)
     if len(ingested) != 1:
         raise FileIngestionError(
             f"'{_file_name(file)}' contains {len(ingested)} report files; "

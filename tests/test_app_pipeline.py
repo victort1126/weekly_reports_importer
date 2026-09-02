@@ -44,6 +44,53 @@ class AppPipelineTests(unittest.TestCase):
         self.assertEqual(sources, zip_sources)
         self.assertEqual(errors, [])
 
+    def test_recognized_workbook_skips_llm_extraction(self) -> None:
+        report = WeeklyReport(
+            employee_name="王怡明",
+            iso_year_week="2026-W32",
+            tasks_completed="完成跌倒识别",
+        )
+        sheets_client = MagicMock()
+        sheets_client.lookup_employee.return_value = None
+        sheets_client.report_exists.return_value = False
+        say = MagicMock()
+        event = {
+            "type": "message",
+            "channel": app.config.slack_channel_id or "C1",
+            "ts": "1785280000.000100",
+            "files": [{"name": "工作周报.xlsx"}],
+        }
+
+        with (
+            patch(
+                "app._load_report_sources",
+                return_value=(
+                    [
+                        IngestedFile(
+                            name="工作周报.xlsx",
+                            text="unused when table-extracted",
+                            reports=(report,),
+                            needs_llm=False,
+                        )
+                    ],
+                    [],
+                ),
+            ),
+            patch("app.extract_reports") as extract_reports,
+            patch("app.get_sheets_client", return_value=sheets_client),
+        ):
+            app.handle_report_message(
+                event=event,
+                say=say,
+                client=MagicMock(),
+            )
+
+        extract_reports.assert_not_called()
+        self.assertEqual(sheets_client.append_report.call_count, 1)
+        saved = sheets_client.append_report.call_args.args[0]
+        self.assertEqual(saved.employee_name, "王怡明")
+        self.assertEqual(saved.iso_year_week, "2026-W32")
+
     def test_one_workbook_source_appends_every_extracted_employee(self) -> None:
         reports = [
             WeeklyReport(

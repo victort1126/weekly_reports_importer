@@ -102,7 +102,9 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
 
         try:
             ingested_files = ingest_slack_files(
-                file_metadata, config.slack_bot_token
+                file_metadata,
+                config.slack_bot_token,
+                message_date=_message_datetime(event),
             )
         except FileIngestionError as exc:
             logger.warning("Attachment '%s' failed: %s", file_label, exc)
@@ -126,7 +128,14 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
                     f"Slack message context:\n{message_text}\n\n"
                     f"Attached file content:\n{content}"
                 )
-            sources.append(IngestedFile(name=ingested.name, text=content))
+            sources.append(
+                IngestedFile(
+                    name=ingested.name,
+                    text=content,
+                    reports=ingested.reports,
+                    needs_llm=ingested.needs_llm,
+                )
+            )
 
     # For file-based submissions, the message text is context for the file,
     # not a second report. Ordinary forwarded/pasted messages remain one source.
@@ -210,20 +219,39 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
     file_links = get_file_links(event.get("files", []))
     reports: list[tuple[str, WeeklyReport]] = []
     for source in sources:
-        logger.info(
-            "LLM extraction starting for '%s' (%s chars)...",
-            source.name,
-            len(source.text),
-        )
         try:
-            extracted = extract_reports(
-                source.text, _message_datetime(event), source_name=source.name
-            )
-            logger.info(
-                "LLM extraction finished for '%s': %d report(s)",
-                source.name,
-                len(extracted),
-            )
+            extracted: list[WeeklyReport] = []
+            if source.reports:
+                logger.info(
+                    "Using %d table-extracted report(s) from '%s' (no LLM)",
+                    len(source.reports),
+                    source.name,
+                )
+                extracted.extend(source.reports)
+            if source.needs_llm:
+                logger.info(
+                    "LLM extraction starting for '%s' (%s chars)...",
+                    source.name,
+                    len(source.text),
+                )
+                extracted.extend(
+                    extract_reports(
+                        source.text, _message_datetime(event), source_name=source.name
+                    )
+                )
+                logger.info(
+                    "LLM extraction finished for '%s': %d report(s)",
+                    source.name,
+                    len(extracted),
+                )
+            elif not source.reports:
+                errors.append(f"'{source.name}' contained no extractable weekly reports.")
+                continue
+            else:
+                logger.info(
+                    "LLM extraction skipped for '%s': table columns already mapped",
+                    source.name,
+                )
             reports.extend((source.name, report) for report in extracted)
         except ReportExtractionError as exc:
             logger.warning("Extraction failed for %s: %s", source.name, exc)

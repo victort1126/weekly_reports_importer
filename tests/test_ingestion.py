@@ -87,6 +87,7 @@ class IngestionTests(unittest.TestCase):
         first.append(["Name", "Completed", "Next"])
         first.append(["Jane Doe", "Feature A", "Feature B"])
         second = workbook.create_sheet("Growth")
+        second.append(["Name", "Completed", "Next"])
         second.append(["John Smith", "Campaign A", "Campaign B"])
         buffer = BytesIO()
         workbook.save(buffer)
@@ -102,9 +103,17 @@ class IngestionTests(unittest.TestCase):
             result = ingest_slack_file(file, "xoxb-test")
 
         self.assertIn("=== Worksheet: Platform ===", result.text)
-        self.assertIn("Jane Doe\tFeature A\tFeature B", result.text)
+        self.assertIn("Name (employee_name): Jane Doe", result.text)
+        self.assertIn("Completed (tasks_completed): Feature A", result.text)
         self.assertIn("=== Worksheet: Growth ===", result.text)
-        self.assertIn("John Smith\tCampaign A\tCampaign B", result.text)
+        self.assertFalse(result.needs_llm)
+        self.assertEqual(
+            [report.employee_name for report in result.reports],
+            ["Jane Doe", "John Smith"],
+        )
+        self.assertEqual(result.reports[0].tasks_completed, "Feature A")
+        self.assertEqual(result.reports[0].next_steps, "Feature B")
+        self.assertEqual(result.reports[1].tasks_completed, "Campaign A")
 
     def test_common_xslx_filename_typo_is_accepted(self) -> None:
         self.assertTrue(is_supported_report_file({"name": "bundle.xslx"}))
@@ -141,8 +150,14 @@ class IngestionTests(unittest.TestCase):
                 "team-weeklies.zip / Growth/John Smith.xslx",
             ],
         )
-        self.assertIn("Jane Doe\tFeature A", results[0].text)
-        self.assertIn("John Smith\tCampaign A", results[1].text)
+        self.assertIn("Jane Doe", results[0].text)
+        self.assertIn("Feature A", results[0].text)
+        self.assertEqual(results[0].reports[0].employee_name, "Jane Doe")
+        self.assertFalse(results[0].needs_llm)
+        self.assertIn("John Smith", results[1].text)
+        self.assertIn("Campaign A", results[1].text)
+        self.assertEqual(results[1].reports[0].employee_name, "John Smith")
+        self.assertFalse(results[1].needs_llm)
 
     def test_zip_with_no_supported_reports_is_rejected(self) -> None:
         archive_buffer = BytesIO()
@@ -166,6 +181,26 @@ class IngestionTests(unittest.TestCase):
 
     def test_zip_is_recognized_as_supported(self) -> None:
         self.assertTrue(is_supported_report_file({"name": "team-weeklies.zip"}))
+
+    def test_report_batch_drops_blank_tasks_instead_of_failing(self) -> None:
+        """A stub first report (the original Excel failure) must not abort the batch."""
+        batch = ReportBatch.model_validate(
+            {
+                "reports": [
+                    {
+                        "employee_name": "Header Row",
+                        "iso_year_week": "2026-W32",
+                        "tasks_completed": "",
+                    },
+                    {
+                        "employee_name": "王怡明",
+                        "iso_year_week": "2026-W32",
+                        "tasks_completed": "完成跌倒识别",
+                    },
+                ]
+            }
+        )
+        self.assertEqual([report.employee_name for report in batch.reports], ["王怡明"])
 
     def test_report_batch_keeps_employees_separate(self) -> None:
         batch = ReportBatch(

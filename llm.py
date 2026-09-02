@@ -84,7 +84,15 @@ a forwarded Slack DM, a Markdown file, or a text rendering of an Excel workbook.
 contain one employee report or several reports bundled together.
 
 Return exactly one report object per employee found in the input. Never combine different \
-employees into one report. Repeated worksheet/header rows are context, not employee reports.
+employees into one report. Repeated worksheet/header rows are context, not employee reports. \
+If a row or section has no employee name or no completed-work text, omit it entirely -- \
+never return a report with a blank employee_name or tasks_completed.
+
+Excel collection forms (Chinese or English) may use headers such as 填写者/Name, \
+汇报日期/Date, 本周工作总结/Tasks completed, 下周工作计划/Next steps, \
+遇到的阻碍/风险/问题/Blockers, 需要其他人协助的事项/Needs from others. Treat each \
+labeled record as one employee report. Extra columns (e.g. 提交时间) are metadata, \
+not a separate report. Keep multiline cell contents inside the field they belong to.
 
 For each employee report, extract exactly these fields:
 - employee_name: the report author's full name.
