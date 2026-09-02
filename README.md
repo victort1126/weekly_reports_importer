@@ -130,7 +130,9 @@ test it end-to-end; the bot will reply in-thread with the parsed result.
 
 ### Supported report inputs
 
-- Forwarded or pasted Slack message text.
+- Forwarded or pasted Slack message text. Workbooks attached to a forwarded
+  DM (nested under Slack's `attachments[].files`) are downloaded the same way
+  as files uploaded directly into the channel.
 - `.md` / `.markdown` files. The file is downloaded with the bot token and its
   Markdown formatting is preserved through extraction, then rendered as rich
   text in Google Sheets.

@@ -84,6 +84,34 @@ class BatchExtractionTests(unittest.TestCase):
         self.assertEqual(reports[0].tasks_completed, "呼梯日志全链路")
         self.assertEqual(reports[0].iso_year_week, "2026-W35")
 
+    def test_extract_many_drops_bracketed_forward_filename_stub(self) -> None:
+        batch = ReportBatch(
+            reports=[
+                WeeklyReport(
+                    employee_name="邝锦明",
+                    iso_year_week="2026-W35",
+                    tasks_completed=(
+                        "[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx"
+                    ),
+                )
+            ]
+        )
+        message = MagicMock(parsed=batch, refusal=None)
+        completion = MagicMock(choices=[MagicMock(message=message)])
+        extractor = ReportExtractor.__new__(ReportExtractor)
+        extractor._client = MagicMock()
+        extractor._client.chat.completions.parse.return_value = completion
+
+        from llm import ReportExtractionError
+
+        with self.assertRaises(ReportExtractionError) as raised:
+            extractor.extract_many(
+                "[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx",
+                datetime(2026, 8, 28, tzinfo=timezone.utc),
+                source_name="工作周报.xlsx",
+            )
+        self.assertIn("filename", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

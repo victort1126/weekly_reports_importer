@@ -70,6 +70,137 @@ class AppPipelineTests(unittest.TestCase):
         self.assertEqual(sources[0].text, ingested.text)
         self.assertNotIn("Slack message context", sources[0].text)
 
+    def test_forwarded_attachment_workbook_is_ingested(self) -> None:
+        event = {
+            "type": "message",
+            "files": [],
+            "attachments": [
+                {
+                    "is_share": True,
+                    "fallback": (
+                        "[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx"
+                    ),
+                    "files": [
+                        {
+                            "id": "F123",
+                            "name": "工作周报.xlsx",
+                            "url_private_download": (
+                                "https://files.slack.test/weekly.xlsx"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        report = WeeklyReport(
+            employee_name="邝锦明",
+            iso_year_week="2026-W35",
+            tasks_completed="呼梯日志全链路",
+        )
+        ingested = IngestedFile(
+            name="工作周报.xlsx",
+            text="workbook",
+            reports=(report,),
+            needs_llm=False,
+        )
+
+        with patch("app.ingest_slack_files", return_value=[ingested]) as ingest:
+            sources, errors = app._load_report_sources(event, MagicMock())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].name, "工作周报.xlsx")
+        self.assertEqual(sources[0].reports, (report,))
+        self.assertFalse(sources[0].needs_llm)
+        ingest.assert_called_once()
+
+    def test_forwarded_workbook_saves_table_extracted_rows(self) -> None:
+        event = {
+            "type": "message",
+            "channel": app.config.slack_channel_id or "C1",
+            "ts": "1785280000.000100",
+            "files": [],
+            "attachments": [
+                {
+                    "is_share": True,
+                    "fallback": (
+                        "[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx"
+                    ),
+                    "files": [
+                        {
+                            "id": "F123",
+                            "name": "工作周报.xlsx",
+                            "url_private_download": (
+                                "https://files.slack.test/weekly.xlsx"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        report = WeeklyReport(
+            employee_name="邝锦明",
+            iso_year_week="2026-W35",
+            tasks_completed="呼梯日志全链路",
+        )
+        ingested = IngestedFile(
+            name="工作周报.xlsx",
+            text="workbook",
+            reports=(report,),
+            needs_llm=False,
+        )
+        sheets_client = MagicMock()
+        sheets_client.lookup_employee.return_value = None
+        sheets_client.report_exists.return_value = False
+        say = MagicMock()
+
+        with (
+            patch("app.ingest_slack_files", return_value=[ingested]),
+            patch("app.extract_reports") as extract_reports,
+            patch("app.get_sheets_client", return_value=sheets_client),
+        ):
+            app.handle_report_message(event=event, say=say, client=MagicMock())
+
+        extract_reports.assert_not_called()
+        self.assertEqual(sheets_client.append_report.call_count, 1)
+        saved = sheets_client.append_report.call_args.args[0]
+        self.assertEqual(saved.employee_name, "邝锦明")
+        self.assertEqual(saved.tasks_completed, "呼梯日志全链路")
+        self.assertEqual(saved.iso_year_week, "2026-W35")
+
+    def test_inaccessible_forwarded_file_does_not_save_a_stub_row(self) -> None:
+        event = {
+            "type": "message",
+            "channel": app.config.slack_channel_id or "C1",
+            "ts": "1785280000.000100",
+            "files": [],
+            "attachments": [
+                {
+                    "is_share": True,
+                    "fallback": (
+                        "[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx"
+                    ),
+                    "files": [{"id": "F123", "name": "工作周报.xlsx"}],
+                }
+            ],
+        }
+        client = MagicMock()
+        client.files_info.side_effect = RuntimeError("not_allowed")
+        sheets_client = MagicMock()
+        say = MagicMock()
+
+        with (
+            patch("app.extract_reports") as extract_reports,
+            patch("app.get_sheets_client", return_value=sheets_client),
+        ):
+            app.handle_report_message(event=event, say=say, client=client)
+
+        extract_reports.assert_not_called()
+        sheets_client.append_report.assert_not_called()
+        reply = say.call_args.kwargs["text"]
+        self.assertIn("工作周报.xlsx", reply)
+        self.assertIn("could not download", reply.lower())
+
     def test_recognized_workbook_skips_llm_extraction(self) -> None:
         report = WeeklyReport(
             employee_name="王怡明",

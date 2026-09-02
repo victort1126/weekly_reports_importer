@@ -25,10 +25,12 @@ from models import EnrichedReport, WeeklyReport
 from sheets import SheetsError, get_sheets_client
 from slack_handler import (
     build_report_text,
+    collect_report_files,
     get_file_links,
     is_ignorable_message,
     merge_demo_links,
 )
+from text_cleanup import is_file_reference_only
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -68,59 +70,66 @@ def _build_skip_reply(enriched: EnrichedReport) -> str:
     ).format(name=enriched.employee_name, week=enriched.iso_year_week)
 
 
-def _message_is_attachment_filename(message_text: str, files: list[dict]) -> bool:
-    """True when Slack's message text is only the uploaded file's name.
+def _file_label(file: dict) -> str:
+    return str(file.get("name") or file.get("title") or "file")
 
-    Slack often sets event.text to '工作周报.xlsx' for a file upload. Feeding
-    that to the LLM as 'report context' is how a stub row with the filename as
-    tasks_completed gets saved.
-    """
-    stripped = message_text.strip()
-    if not stripped:
-        return True
-    names: set[str] = set()
+
+def _known_file_names(files: list[dict]) -> tuple[str, ...]:
+    names: list[str] = []
     for file in files:
         for key in ("name", "title"):
             value = str(file.get(key) or "").strip()
-            if not value:
-                continue
-            names.add(value)
-            names.add(value.replace("\\", "/").rsplit("/", 1)[-1])
-    return stripped in names
+            if value:
+                names.append(value)
+    return tuple(names)
+
+
+def _hydrate_slack_file(file: dict, client) -> dict:
+    """Fill in download URLs / filetype for stub file objects from forwarded messages."""
+    has_url = bool(file.get("url_private_download") or file.get("url_private"))
+    recognized = is_supported_report_file(file)
+    file_id = file.get("id")
+    if file_id and (not has_url or not recognized):
+        response = client.files_info(file=file_id)
+        return response.get("file", file)
+    return file
 
 
 def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[str]]:
     """Build LLM input sources from message text and supported attachments."""
     message_text = build_report_text(event)
-    supported_files = [
-        file for file in event.get("files", []) if is_supported_report_file(file)
-    ]
+    candidates = collect_report_files(event)
     logger.info(
-        "Building report sources: message text=%s chars, supported attachment(s)=%d",
+        "Building report sources: message text=%s chars, candidate file(s)=%d",
         len(message_text),
-        len(supported_files),
+        len(candidates),
     )
     sources: list[IngestedFile] = []
     errors: list[str] = []
 
-    for file in supported_files:
-        file_label = file.get("name") or file.get("title") or "file"
-        logger.info("Ingesting attachment '%s'...", file_label)
-        file_metadata = file
-        if not (
-            file_metadata.get("url_private_download")
-            or file_metadata.get("url_private")
-        ) and file_metadata.get("id"):
-            try:
-                response = client.files_info(file=file_metadata["id"])
-                file_metadata = response.get("file", file_metadata)
-            except Exception as exc:  # Slack SDK exception types vary by adapter
-                errors.append(
-                    f"Could not retrieve Slack metadata for "
-                    f"'{file.get('name') or file.get('title') or 'file'}': {exc}"
-                )
-                continue
+    hydrated: list[dict] = []
+    for file in candidates:
+        file_label = _file_label(file)
+        try:
+            file = _hydrate_slack_file(file, client)
+        except Exception as exc:  # Slack SDK exception types vary by adapter
+            errors.append(
+                f"Could not retrieve Slack metadata for '{file_label}': {exc}"
+            )
+            continue
+        hydrated.append(file)
 
+    supported_files = [file for file in hydrated if is_supported_report_file(file)]
+    known_names = _known_file_names(list(candidates) + hydrated)
+    logger.info(
+        "After hydration: %d supported report file(s) of %d candidate(s)",
+        len(supported_files),
+        len(hydrated),
+    )
+
+    for file_metadata in supported_files:
+        file_label = _file_label(file_metadata)
+        logger.info("Ingesting attachment '%s'...", file_label)
         try:
             ingested_files = ingest_slack_files(
                 file_metadata,
@@ -144,9 +153,7 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
                 len(ingested.text),
             )
             content = ingested.text
-            if message_text and not _message_is_attachment_filename(
-                message_text, supported_files
-            ):
+            if message_text and not is_file_reference_only(message_text, known_names):
                 content = (
                     f"Slack message context:\n{message_text}\n\n"
                     f"Attached file content:\n{content}"
@@ -162,9 +169,19 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
 
     # For file-based submissions, the message text is context for the file,
     # not a second report. Ordinary forwarded/pasted messages remain one source.
-    if not supported_files and message_text:
-        sources.append(IngestedFile(name="Slack message", text=message_text))
-        logger.info("Using Slack message text only (%s chars)", len(message_text))
+    # A forwarded fallback whose only content is a filename must never become
+    # an LLM source — that is how stub Report Log rows were created.
+    if not sources and not supported_files and message_text:
+        if is_file_reference_only(message_text, known_names):
+            label = known_names[0] if known_names else "the attached report"
+            errors.append(
+                f"Found a reference to '{label}' but could not download it. "
+                "Please upload the file directly into the channel."
+            )
+            logger.warning("File-reference-only message with no ingestible attachment")
+        else:
+            sources.append(IngestedFile(name="Slack message", text=message_text))
+            logger.info("Using Slack message text only (%s chars)", len(message_text))
 
     logger.info("Report sources ready: %d source(s), %d error(s)", len(sources), len(errors))
     return sources, errors
@@ -239,7 +256,7 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
             )
         return
 
-    file_links = get_file_links(event.get("files", []))
+    file_links = get_file_links(collect_report_files(event, log=False))
     reports: list[tuple[str, WeeklyReport]] = []
     for source in sources:
         try:

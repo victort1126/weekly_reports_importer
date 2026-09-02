@@ -10,10 +10,13 @@ permalinks for `demo_links`.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from file_ingest import is_supported_report_file
+
+logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -72,6 +75,66 @@ def _extract_attachments_text(attachments: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
+def _file_dedupe_key(file: dict[str, Any]) -> tuple[str, ...]:
+    """Prefer Slack file id; fall back to name + download URL for stub objects."""
+    file_id = str(file.get("id") or "").strip()
+    if file_id:
+        return ("id", file_id)
+    name = str(file.get("name") or file.get("title") or "")
+    url = str(file.get("url_private_download") or file.get("url_private") or "")
+    return ("name_url", name, url)
+
+
+def collect_report_files(
+    event: dict[str, Any], *, log: bool = True
+) -> list[dict[str, Any]]:
+    """Return every file on the message, including nested forwarded attachments.
+
+    Slack puts files from a forwarded/shared message in
+    ``attachments[].files``, not the top-level ``event["files"]`` array. Skipping
+    that nest is how a workbook upload became a row whose tasks were the
+    forwarded fallback string.
+    """
+    seen: set[tuple[str, ...]] = set()
+    collected: list[dict[str, Any]] = []
+    n_direct = 0
+    n_forwarded = 0
+
+    def _add(file: Any, *, forwarded: bool) -> None:
+        nonlocal n_direct, n_forwarded
+        if not isinstance(file, dict):
+            return
+        key = _file_dedupe_key(file)
+        if key in seen:
+            return
+        seen.add(key)
+        collected.append(file)
+        if forwarded:
+            n_forwarded += 1
+        else:
+            n_direct += 1
+
+    for file in event.get("files") or []:
+        _add(file, forwarded=False)
+
+    for attachment in event.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        # Flags vary by client (`is_share`, `is_msg_unfurl`, `is_reply_unfurl`),
+        # so any attachment that actually carries files is treated as a source.
+        for file in attachment.get("files") or []:
+            _add(file, forwarded=True)
+
+    if collected and log:
+        logger.info(
+            "Collected %d file(s): %d on the message, %d nested in forwarded attachments",
+            len(collected),
+            n_direct,
+            n_forwarded,
+        )
+    return collected
+
+
 def get_file_links(files: list[dict[str, Any]]) -> list[str]:
     """Return links for non-report attachments such as screenshots/demos."""
     links: list[str] = []
@@ -103,7 +166,7 @@ def build_report_text(event: dict[str, Any]) -> str:
 
     files = [
         file
-        for file in event.get("files", [])
+        for file in collect_report_files(event, log=False)
         if not is_supported_report_file(file)
     ]
     if files:

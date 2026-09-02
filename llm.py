@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,6 +13,7 @@ from openai import AzureOpenAI
 
 from config import config
 from models import EmployeeMatch, ReportBatch, RosterEntry, WeeklyReport
+from text_cleanup import is_file_reference_only
 
 logger = logging.getLogger(__name__)
 
@@ -25,25 +25,18 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
-_FILENAME_TASKS_RE = re.compile(
-    r"(?is)^[\w. \-()（）]+\.(xlsx|xslx|xls|xlsm|md|markdown|zip|csv|docx?)$"
-)
-
-
 def _tasks_are_filename_metadata(tasks: str, source_name: str | None) -> bool:
     """True when tasks_completed is an attachment name, not work the employee did.
 
     After the blank-tasks validator started dropping empty strings, the model
-    could satisfy the schema by copying '工作周报.xlsx' from the source line.
+    could satisfy the schema by copying '工作周报.xlsx' from the source line, or
+    the forwarded fallback '[August 28th, 2026 6:56 PM] kuangjinming: 工作周报.xlsx'.
     """
-    text = (tasks or "").strip()
-    if not text or "\n" in text:
-        return False
+    known: tuple[str, ...] = ()
     if source_name:
         source_base = Path(str(source_name).replace("\\", "/")).name
-        if text in {source_name.strip(), source_base}:
-            return True
-    return bool(_FILENAME_TASKS_RE.match(text))
+        known = (str(source_name).strip(), source_base)
+    return is_file_reference_only(tasks, known)
 
 
 @dataclass(frozen=True)
