@@ -200,6 +200,45 @@ class ExcelParseTests(unittest.TestCase):
         self.assertEqual(result.reports[0].next_steps, "继续测试")
         self.assertEqual(result.reports[0].iso_year_week, "2026-W32")
 
+    def test_long_header_hint_still_maps_the_column(self) -> None:
+        parsed = parse_worksheet_tables(
+            [
+                (
+                    "收集表单",
+                    [
+                        [
+                            "填写者",
+                            "本周工作总结（请填写本周完成的工作，可换行）",
+                            "汇报日期",
+                        ],
+                        ["邝锦明", "修复调度器栈溢出", "2026年8月7日"],
+                    ],
+                )
+            ]
+        )
+        self.assertFalse(parsed.needs_llm)
+        self.assertEqual(parsed.reports[0].employee_name, "邝锦明")
+        self.assertEqual(parsed.reports[0].tasks_completed, "修复调度器栈溢出")
+        self.assertEqual(parsed.reports[0].iso_year_week, "2026-W32")
+
+    def test_cover_sheet_does_not_send_table_workbook_to_llm(self) -> None:
+        parsed = parse_worksheet_tables(
+            [
+                ("封面", [["工作周报.xlsx"], ["请各位周五前提交"]]),
+                (
+                    "收集表单",
+                    [
+                        ["填写者", "本周工作总结", "汇报日期"],
+                        ["邝锦明", "呼梯日志全链路", "2026年8月28日"],
+                    ],
+                ),
+            ]
+        )
+        self.assertFalse(parsed.needs_llm)
+        self.assertEqual(len(parsed.reports), 1)
+        self.assertEqual(parsed.reports[0].tasks_completed, "呼梯日志全链路")
+        self.assertNotEqual(parsed.reports[0].iso_year_week, "2026-W36")
+
 
 if __name__ == "__main__":
     unittest.main()

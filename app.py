@@ -68,6 +68,27 @@ def _build_skip_reply(enriched: EnrichedReport) -> str:
     ).format(name=enriched.employee_name, week=enriched.iso_year_week)
 
 
+def _message_is_attachment_filename(message_text: str, files: list[dict]) -> bool:
+    """True when Slack's message text is only the uploaded file's name.
+
+    Slack often sets event.text to '工作周报.xlsx' for a file upload. Feeding
+    that to the LLM as 'report context' is how a stub row with the filename as
+    tasks_completed gets saved.
+    """
+    stripped = message_text.strip()
+    if not stripped:
+        return True
+    names: set[str] = set()
+    for file in files:
+        for key in ("name", "title"):
+            value = str(file.get(key) or "").strip()
+            if not value:
+                continue
+            names.add(value)
+            names.add(value.replace("\\", "/").rsplit("/", 1)[-1])
+    return stripped in names
+
+
 def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[str]]:
     """Build LLM input sources from message text and supported attachments."""
     message_text = build_report_text(event)
@@ -123,7 +144,9 @@ def _load_report_sources(event: dict, client) -> tuple[list[IngestedFile], list[
                 len(ingested.text),
             )
             content = ingested.text
-            if message_text:
+            if message_text and not _message_is_attachment_filename(
+                message_text, supported_files
+            ):
                 content = (
                     f"Slack message context:\n{message_text}\n\n"
                     f"Attached file content:\n{content}"

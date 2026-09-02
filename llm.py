@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from openai import AzureOpenAI
@@ -21,6 +23,27 @@ def _coerce_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+_FILENAME_TASKS_RE = re.compile(
+    r"(?is)^[\w. \-()（）]+\.(xlsx|xslx|xls|xlsm|md|markdown|zip|csv|docx?)$"
+)
+
+
+def _tasks_are_filename_metadata(tasks: str, source_name: str | None) -> bool:
+    """True when tasks_completed is an attachment name, not work the employee did.
+
+    After the blank-tasks validator started dropping empty strings, the model
+    could satisfy the schema by copying '工作周报.xlsx' from the source line.
+    """
+    text = (tasks or "").strip()
+    if not text or "\n" in text:
+        return False
+    if source_name:
+        source_base = Path(str(source_name).replace("\\", "/")).name
+        if text in {source_name.strip(), source_base}:
+            return True
+    return bool(_FILENAME_TASKS_RE.match(text))
 
 
 @dataclass(frozen=True)
@@ -86,7 +109,9 @@ contain one employee report or several reports bundled together.
 Return exactly one report object per employee found in the input. Never combine different \
 employees into one report. Repeated worksheet/header rows are context, not employee reports. \
 If a row or section has no employee name or no completed-work text, omit it entirely -- \
-never return a report with a blank employee_name or tasks_completed.
+never return a report with a blank employee_name or tasks_completed. Never copy a Slack \
+filename, the 'Source file/message' line, or an attachment name into tasks_completed; \
+those are metadata, not work the employee did.
 
 Excel collection forms (Chinese or English) may use headers such as 填写者/Name, \
 汇报日期/Date, 本周工作总结/Tasks completed, 下周工作计划/Next steps, \
@@ -236,7 +261,23 @@ class ReportExtractor:
             len(parsed.reports),
             source_name or "message",
         )
-        return parsed.reports
+        kept = [
+            report
+            for report in parsed.reports
+            if not _tasks_are_filename_metadata(report.tasks_completed, source_name)
+        ]
+        dropped = len(parsed.reports) - len(kept)
+        if dropped:
+            logger.warning(
+                "Dropped %d extracted report(s) whose tasks_completed was a filename",
+                dropped,
+            )
+        if not kept:
+            raise ReportExtractionError(
+                "LLM returned no usable weekly reports (tasks looked like a "
+                "filename rather than completed work)."
+            )
+        return kept
 
     def extract(
         self, report_text: str, message_date: datetime | None = None

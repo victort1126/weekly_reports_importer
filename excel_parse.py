@@ -173,6 +173,10 @@ _CHINESE_DATE_RE = re.compile(
 _ISO_DATE_RE = re.compile(r"(?P<year>\d{4})[-/.](?P<month>\d{1,2})[-/.](?P<day>\d{1,2})")
 _ISO_WEEK_RE = re.compile(r"(?P<year>\d{4})-W(?P<week>\d{2})", re.IGNORECASE)
 _HEADER_SCAN_ROWS = 15
+# Only cells this short are treated as possible column labels. Body text in a
+# 本周工作总结 cell is much longer; matching aliases inside it would steal the
+# header row (e.g. the word "问题" in a work summary).
+_LABEL_CELL_MAX_LEN = 80
 
 # Latin aliases shorter than this are exact-match only. Otherwise "week" inside
 # "nextweek" would map a Next-week column onto iso_year_week.
@@ -220,7 +224,7 @@ def _build_alias_index() -> list[tuple[str, str, bool]]:
 _ALIAS_INDEX = _build_alias_index()
 
 
-def _match_field(header: str) -> str | None:
+def _match_field(header: str, *, allow_substring: bool = True) -> str | None:
     """Return the canonical field for a header, or None if it is unknown/metadata."""
     normalized = _normalize_header(header)
     if not normalized or normalized in _IGNORED_HEADERS:
@@ -230,10 +234,20 @@ def _match_field(header: str) -> str | None:
         if normalized == alias:
             return field
 
+    if not allow_substring:
+        return None
     for field, alias, substring_ok in _ALIAS_INDEX:
         if substring_ok and alias in normalized:
             return field
     return None
+
+
+def _is_label_cell(value: str) -> bool:
+    """True when a cell is short enough to be a column header rather than body text."""
+    stripped = value.strip()
+    if not stripped or len(stripped) > _LABEL_CELL_MAX_LEN:
+        return False
+    return stripped.count("\n") <= 1
 
 
 def _is_header_like(values: list[str]) -> bool:
@@ -241,30 +255,49 @@ def _is_header_like(values: list[str]) -> bool:
     populated = [value.strip() for value in values if value.strip()]
     if len(populated) < 2:
         return False
-    return all(len(value) <= 40 and "\n" not in value for value in populated)
+    return all(_is_label_cell(value) for value in populated)
+
+
+def _cell_header_field(cell: str) -> str | None:
+    """Map one cell onto a canonical field without matching inside report body text."""
+    stripped = cell.strip()
+    if not stripped:
+        return None
+    if _is_label_cell(stripped):
+        return _match_field(stripped)
+    # Long cells: only the first line, exact alias match. Substring matching
+    # would treat a summary that happens to contain "问题" as a Blockers header.
+    first_line = stripped.split("\n", 1)[0].strip()
+    if first_line and len(first_line) <= _LABEL_CELL_MAX_LEN:
+        return _match_field(first_line, allow_substring=False)
+    return None
+
+
+def _row_field_mapping(row: list[str]) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for col, cell in enumerate(row):
+        field = _cell_header_field(cell)
+        if field and field not in mapping.values():
+            mapping[col] = field
+    return mapping
 
 
 def _find_header_row(rows: list[list[str]]) -> tuple[int, dict[int, str]] | None:
     """Pick the row that maps onto the most canonical fields.
 
-    Collection forms often put a title in row 1 and the real headers in row 2;
-    scanning the first few non-empty rows absorbs that kind of tweak.
+    Collection forms often put a title in row 1 and the real headers in row 2.
+    One slightly long header cell (a parenthetical hint) must not disqualify
+    the row — only cells that look like labels are eligible to match.
     """
     best: tuple[int, dict[int, str], int] | None = None
     scanned = 0
     for index, row in enumerate(rows):
         if not any(cell.strip() for cell in row):
             continue
-        if not _is_header_like(row):
-            continue
         scanned += 1
-        mapping: dict[int, str] = {}
-        for col, header in enumerate(row):
-            field = _match_field(header)
-            if field and field not in mapping.values():
-                mapping[col] = field
+        mapping = _row_field_mapping(row)
         score = len(mapping)
-        if score and (best is None or score > best[2]):
+        if score >= 2 and (best is None or score > best[2]):
             best = (index, mapping, score)
         if scanned >= _HEADER_SCAN_ROWS:
             break
@@ -419,10 +452,8 @@ def parse_worksheet_tables(
     and do not need the LLM. Unrecognized sheets are still rendered as labeled
     records so a later LLM pass can try.
     """
-    sections_for_llm: list[str] = []
     sections_all: list[str] = []
     reports: list[WeeklyReport] = []
-    unrecognized_sheets = 0
     record_number = 0
 
     for title, rows in sheets:
@@ -448,9 +479,6 @@ def parse_worksheet_tables(
             # use it as display headers so the LLM sees column names.
             headers = populated[0]
             header_index = 0
-
-        if not recognized:
-            unrecognized_sheets += 1
 
         sheet_blocks: list[str] = []
         data_rows = populated[header_index + 1 :] if header_index >= 0 else populated
@@ -482,23 +510,23 @@ def parse_worksheet_tables(
                     if col < len(headers)
                 )
                 mapping_note = f"\nDetected columns: {mapped}"
-            section = (
+            sections_all.append(
                 f"=== Worksheet: {title} ==={mapping_note}\n" + "\n\n".join(sheet_blocks)
             )
-            sections_all.append(section)
             if recognized:
                 logger.info(
                     "Excel sheet '%s' recognized as a weekly-report table: %d report(s)",
                     title,
                     extracted_here,
                 )
-            else:
-                sections_for_llm.append(section)
 
     if not sections_all:
         return ParsedWorkbook(text="", reports=(), needs_llm=True)
 
-    if unrecognized_sheets == 0 and reports:
+    # Table-extracted reports already have verbatim cell text. Calling the LLM
+    # as well would let it invent a stub from the Slack filename/message date
+    # and save that instead of (or in addition to) the workbook contents.
+    if reports:
         logger.info(
             "Workbook extracted %d report(s) from table columns; LLM extraction not needed",
             len(reports),
@@ -509,11 +537,8 @@ def parse_worksheet_tables(
             needs_llm=False,
         )
 
-    # Unrecognized sheets still need the LLM. Send only those sheets when some
-    # reports were already extracted, so the same employee is not imported twice.
-    llm_text = "\n\n".join(sections_for_llm or sections_all)
     return ParsedWorkbook(
-        text=llm_text,
-        reports=tuple(reports),
+        text="\n\n".join(sections_all),
+        reports=(),
         needs_llm=True,
     )

@@ -44,6 +44,32 @@ class AppPipelineTests(unittest.TestCase):
         self.assertEqual(sources, zip_sources)
         self.assertEqual(errors, [])
 
+    def test_filename_only_slack_text_is_not_used_as_report_context(self) -> None:
+        event = {
+            "type": "message",
+            "text": "工作周报.xlsx",
+            "files": [
+                {
+                    "name": "工作周报.xlsx",
+                    "url_private_download": "https://files.slack.test/weekly.xlsx",
+                }
+            ],
+        }
+        ingested = IngestedFile(
+            name="工作周报.xlsx",
+            text="填写者: 邝锦明\n本周工作总结: 呼梯日志",
+            reports=(),
+            needs_llm=True,
+        )
+
+        with patch("app.ingest_slack_files", return_value=[ingested]):
+            sources, errors = app._load_report_sources(event, MagicMock())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].text, ingested.text)
+        self.assertNotIn("Slack message context", sources[0].text)
+
     def test_recognized_workbook_skips_llm_extraction(self) -> None:
         report = WeeklyReport(
             employee_name="王怡明",

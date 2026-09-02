@@ -53,6 +53,37 @@ class BatchExtractionTests(unittest.TestCase):
         self.assertIs(kwargs["response_format"], ReportBatch)
         self.assertIn("team-weekly.xlsx", kwargs["messages"][1]["content"])
 
+    def test_extract_many_drops_filename_stub_reports(self) -> None:
+        batch = ReportBatch(
+            reports=[
+                WeeklyReport(
+                    employee_name="邝锦明",
+                    iso_year_week="2026-W36",
+                    tasks_completed="工作周报.xlsx",
+                ),
+                WeeklyReport(
+                    employee_name="邝锦明",
+                    iso_year_week="2026-W35",
+                    tasks_completed="呼梯日志全链路",
+                ),
+            ]
+        )
+        message = MagicMock(parsed=batch, refusal=None)
+        completion = MagicMock(choices=[MagicMock(message=message)])
+        extractor = ReportExtractor.__new__(ReportExtractor)
+        extractor._client = MagicMock()
+        extractor._client.chat.completions.parse.return_value = completion
+
+        reports = extractor.extract_many(
+            "呼梯日志全链路",
+            datetime(2026, 9, 2, tzinfo=timezone.utc),
+            source_name="工作周报.xlsx",
+        )
+
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].tasks_completed, "呼梯日志全链路")
+        self.assertEqual(reports[0].iso_year_week, "2026-W35")
+
 
 if __name__ == "__main__":
     unittest.main()
