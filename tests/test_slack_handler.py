@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from slack_handler import collect_report_files
+from slack_handler import collect_report_files, parse_retry_command
 from text_cleanup import is_file_reference_only
 
 
@@ -54,6 +54,27 @@ class CollectReportFilesTests(unittest.TestCase):
         collected = collect_report_files(event, log=False)
 
         self.assertEqual(collected, [nested])
+
+
+class ParseRetryCommandTests(unittest.TestCase):
+    def test_exact_retry_words_are_recognized(self) -> None:
+        self.assertEqual(parse_retry_command("retry"), "retry")
+        self.assertEqual(parse_retry_command("Retry"), "retry")
+        self.assertEqual(parse_retry_command("重试"), "retry")
+        self.assertEqual(parse_retry_command("<@U123> retry"), "retry")
+
+    def test_force_variants_are_recognized(self) -> None:
+        self.assertEqual(parse_retry_command("retry force"), "force")
+        self.assertEqual(parse_retry_command("retry!"), "force")
+        self.assertEqual(parse_retry_command("retry！"), "force")
+        self.assertEqual(parse_retry_command("重试 强制"), "force")
+
+    def test_sentences_containing_retry_are_ignored(self) -> None:
+        self.assertIsNone(parse_retry_command("retrying the deploy"))
+        self.assertIsNone(parse_retry_command("please retry later"))
+        self.assertIsNone(parse_retry_command(""))
+        self.assertIsNone(parse_retry_command(None))
+        self.assertIsNone(parse_retry_command("retry this import please"))
 
 
 class FileReferenceOnlyTests(unittest.TestCase):

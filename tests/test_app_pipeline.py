@@ -398,6 +398,192 @@ class AppPipelineTests(unittest.TestCase):
         self.assertIn("prompt: 100", reply)
         self.assertIn("completion: 40", reply)
 
+    def _retry_event(self, text: str = "retry") -> dict:
+        return {
+            "type": "message",
+            "channel": app.config.slack_channel_id or "C1",
+            "ts": "1785280000.000200",
+            "thread_ts": "1785280000.000100",
+            "text": text,
+            "user": "U123",
+        }
+
+    def _parent_message(self) -> dict:
+        return {
+            "ts": "1785280000.000100",
+            "text": "weekly report",
+            "user": "U111",
+        }
+
+    def test_retry_thread_reply_imports_the_parent_message(self) -> None:
+        report = WeeklyReport(
+            employee_name="Jane",
+            team="Platform",
+            iso_year_week="2026-W30",
+            tasks_completed="A",
+        )
+        sheets_client = MagicMock()
+        sheets_client.lookup_employee.return_value = None
+        sheets_client.report_exists.return_value = False
+        say = MagicMock()
+        client = MagicMock()
+        client.conversations_replies.return_value = {
+            "messages": [self._parent_message()]
+        }
+
+        with (
+            patch(
+                "app._load_report_sources",
+                return_value=([IngestedFile(name="weekly.md", text="text")], []),
+            ) as load_sources,
+            patch("app.extract_reports", return_value=[report]),
+            patch("app.get_sheets_client", return_value=sheets_client),
+        ):
+            app.handle_report_message(
+                event=self._retry_event(),
+                say=say,
+                client=client,
+            )
+
+        client.conversations_replies.assert_called_once()
+        parent_event = load_sources.call_args.args[0]
+        self.assertEqual(parent_event["ts"], "1785280000.000100")
+        self.assertEqual(parent_event["text"], "weekly report")
+        self.assertEqual(sheets_client.append_report.call_count, 1)
+        reply_texts = [call.kwargs["text"] for call in say.call_args_list]
+        self.assertTrue(any("Retrying import" in text for text in reply_texts))
+        self.assertTrue(any("Logged weekly report" in text for text in reply_texts))
+
+    def test_bot_reply_does_not_trigger_retry(self) -> None:
+        event = self._retry_event()
+        event["bot_id"] = "B123"
+        say = MagicMock()
+        client = MagicMock()
+        sheets_client = MagicMock()
+
+        with patch("app.get_sheets_client", return_value=sheets_client):
+            app.handle_report_message(event=event, say=say, client=client)
+
+        client.conversations_replies.assert_not_called()
+        sheets_client.append_report.assert_not_called()
+        say.assert_not_called()
+
+    def test_self_message_does_not_trigger_retry(self) -> None:
+        event = self._retry_event()
+        event["user"] = "UBOT"
+        say = MagicMock()
+        client = MagicMock()
+        sheets_client = MagicMock()
+
+        with patch("app.get_sheets_client", return_value=sheets_client):
+            app.handle_report_message(
+                event=event,
+                say=say,
+                client=client,
+                context={"bot_user_id": "UBOT"},
+            )
+
+        client.conversations_replies.assert_not_called()
+        sheets_client.append_report.assert_not_called()
+        say.assert_not_called()
+
+    def test_ordinary_thread_reply_is_ignored(self) -> None:
+        event = self._retry_event(text="thanks, looking into this")
+        say = MagicMock()
+        client = MagicMock()
+        sheets_client = MagicMock()
+
+        with patch("app.get_sheets_client", return_value=sheets_client):
+            app.handle_report_message(event=event, say=say, client=client)
+
+        client.conversations_replies.assert_not_called()
+        sheets_client.append_report.assert_not_called()
+        say.assert_not_called()
+
+    def test_retry_parent_fetch_error_replies_without_saving(self) -> None:
+        say = MagicMock()
+        client = MagicMock()
+        client.conversations_replies.side_effect = RuntimeError("missing_scope")
+        sheets_client = MagicMock()
+
+        with patch("app.get_sheets_client", return_value=sheets_client):
+            app.handle_report_message(
+                event=self._retry_event(),
+                say=say,
+                client=client,
+            )
+
+        sheets_client.append_report.assert_not_called()
+        reply = say.call_args.kwargs["text"]
+        self.assertIn("Could not fetch the original message", reply)
+        self.assertIn("missing_scope", reply)
+
+    def test_retry_force_replaces_existing_row(self) -> None:
+        report = WeeklyReport(
+            employee_name="Jane",
+            team="Platform",
+            iso_year_week="2026-W30",
+            tasks_completed="Corrected",
+        )
+        sheets_client = MagicMock()
+        sheets_client.lookup_employee.return_value = None
+        sheets_client.replace_report.return_value = True
+        say = MagicMock()
+        client = MagicMock()
+        client.conversations_replies.return_value = {
+            "messages": [self._parent_message()]
+        }
+
+        with (
+            patch(
+                "app._load_report_sources",
+                return_value=([IngestedFile(name="weekly.md", text="text")], []),
+            ),
+            patch("app.extract_reports", return_value=[report]),
+            patch("app.get_sheets_client", return_value=sheets_client),
+        ):
+            app.handle_report_message(
+                event=self._retry_event("retry force"),
+                say=say,
+                client=client,
+            )
+
+        sheets_client.replace_report.assert_called_once()
+        sheets_client.append_report.assert_not_called()
+        sheets_client.report_exists.assert_not_called()
+        reply_texts = [call.kwargs["text"] for call in say.call_args_list]
+        self.assertTrue(any("Replaced the existing row" in text for text in reply_texts))
+
+    def test_in_flight_import_rejects_a_second_retry(self) -> None:
+        channel = app.config.slack_channel_id or "C1"
+        thread_ts = "1785280000.000100"
+        key = (channel, thread_ts)
+        say = MagicMock()
+        client = MagicMock()
+        client.conversations_replies.return_value = {
+            "messages": [self._parent_message()]
+        }
+        sheets_client = MagicMock()
+
+        app._ACTIVE_IMPORTS.add(key)
+        try:
+            with (
+                patch("app.get_sheets_client", return_value=sheets_client),
+                patch("app.extract_reports") as extract_reports,
+            ):
+                app.handle_report_message(
+                    event=self._retry_event(),
+                    say=say,
+                    client=client,
+                )
+        finally:
+            app._ACTIVE_IMPORTS.discard(key)
+
+        extract_reports.assert_not_called()
+        sheets_client.append_report.assert_not_called()
+        reply_texts = [call.kwargs["text"] for call in say.call_args_list]
+        self.assertTrue(any("already running" in text.lower() for text in reply_texts))
+
 
 if __name__ == "__main__":
     unittest.main()

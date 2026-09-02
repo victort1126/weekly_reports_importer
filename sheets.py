@@ -244,6 +244,28 @@ class SheetsClient:
 
         return None
 
+    def find_report_row(self, iso_year_week: str, employee_name: str) -> int | None:
+        """Return the 1-based Report Log row for this week + employee, or None."""
+        target = _report_key(iso_year_week, employee_name)
+        sheet_range = f"{_quote_sheet_name(config.report_log_sheet_name)}!B2:C"
+        try:
+            result = (
+                self._values()
+                .get(spreadsheetId=self._spreadsheet_id, range=sheet_range)
+                .execute()
+            )
+        except HttpError as exc:
+            raise SheetsError(
+                f"Failed to read the '{config.report_log_sheet_name}' tab: {exc}"
+            ) from exc
+
+        for offset, row in enumerate(result.get("values", [])):
+            week = row[0].strip() if len(row) > 0 and row[0] else ""
+            name = row[1].strip() if len(row) > 1 and row[1] else ""
+            if week and name and _report_key(week, name) == target:
+                return offset + 2
+        return None
+
     def _get_sheet_id(self, sheet_name: str) -> int:
         if sheet_name not in self._sheet_id_cache:
             try:
@@ -267,19 +289,25 @@ class SheetsClient:
             )
         return self._sheet_id_cache[sheet_name]
 
-    def append_report(self, report: EnrichedReport) -> None:
-        """Append `report` as a new row, rendering any markdown it contains
-        (e.g. `*bold*`) as actual Google Sheets rich text instead of raw markup.
-        """
+    def _plain_row_from_report(
+        self, report: EnrichedReport
+    ) -> tuple[list[str], dict[int, list]]:
+        """Convert a report to sheet cell strings plus any markdown spans."""
         raw_row = report.to_row()
         plain_row: list[str] = []
         spans_by_column: dict[int, list] = {}
-
         for column_offset, value in enumerate(raw_row):
             plain_text, spans = convert_markdown(value)
             plain_row.append(plain_text)
             if spans:
                 spans_by_column[column_offset] = spans
+        return plain_row, spans_by_column
+
+    def append_report(self, report: EnrichedReport) -> None:
+        """Append `report` as a new row, rendering any markdown it contains
+        (e.g. `*bold*`) as actual Google Sheets rich text instead of raw markup.
+        """
+        plain_row, spans_by_column = self._plain_row_from_report(report)
 
         sheet_range = f"{_quote_sheet_name(config.report_log_sheet_name)}!B:J"
         logger.info(
@@ -313,40 +341,104 @@ class SheetsClient:
                 _report_key(report.iso_year_week, report.employee_name)
             )
 
-        if spans_by_column:
-            logger.info(
-                "Applying rich-text formatting to %d cell(s)...",
-                len(spans_by_column),
+        self._apply_rich_text_after_write(updated_range, plain_row, spans_by_column)
+
+    def replace_report(self, report: EnrichedReport) -> bool:
+        """Overwrite the existing Report Log row for this week + employee.
+
+        Returns False when no matching row exists so the caller can append
+        instead. Used by ``retry force`` so a previously saved (possibly
+        wrong) row is replaced rather than skipped as a duplicate.
+        """
+        row_index = self.find_report_row(report.iso_year_week, report.employee_name)
+        if row_index is None:
+            return False
+
+        plain_row, spans_by_column = self._plain_row_from_report(report)
+        sheet_range = (
+            f"{_quote_sheet_name(config.report_log_sheet_name)}!B{row_index}:J{row_index}"
+        )
+        logger.info(
+            "Replacing Report Log row %d for %s (%s)...",
+            row_index,
+            report.employee_name,
+            report.iso_year_week,
+        )
+        try:
+            self._values().update(
+                spreadsheetId=self._spreadsheet_id,
+                range=sheet_range,
+                valueInputOption="USER_ENTERED",
+                body={"values": [plain_row]},
+            ).execute()
+        except HttpError as exc:
+            raise SheetsError(
+                f"Failed to update the '{config.report_log_sheet_name}' tab: {exc}"
+            ) from exc
+
+        if self._report_log_keys_cache is not None:
+            self._report_log_keys_cache.add(
+                _report_key(report.iso_year_week, report.employee_name)
             )
-            try:
-                self._apply_rich_text_formatting(append_result, plain_row, spans_by_column)
-            except Exception:
-                # The row is already saved with correct plain text at this point;
-                # a formatting failure shouldn't be treated as a failed import.
-                logger.exception(
-                    "Saved the report, but failed to apply rich-text formatting "
-                    "to it."
-                )
-            else:
-                logger.info("Rich-text formatting applied")
+
+        self._apply_rich_text_after_write(
+            f"B{row_index}:J{row_index}", plain_row, spans_by_column, row_index=row_index
+        )
+        return True
+
+    def _apply_rich_text_after_write(
+        self,
+        updated_range: str,
+        plain_row: list[str],
+        spans_by_column: dict[int, list],
+        row_index: int | None = None,
+    ) -> None:
+        """Apply markdown rich text; never fail the import if formatting errors."""
+        if not spans_by_column:
+            return
+        logger.info(
+            "Applying rich-text formatting to %d cell(s)...",
+            len(spans_by_column),
+        )
+        try:
+            self._apply_rich_text_formatting(
+                updated_range, plain_row, spans_by_column, row_index=row_index
+            )
+        except Exception:
+            # The row is already saved with correct plain text at this point;
+            # a formatting failure shouldn't be treated as a failed import.
+            logger.exception(
+                "Saved the report, but failed to apply rich-text formatting "
+                "to it."
+            )
+        else:
+            logger.info("Rich-text formatting applied")
 
     def _apply_rich_text_formatting(
         self,
-        append_result: dict,
+        updated_range: str,
+        plain_row: list[str],
+        spans_by_column: dict[int, list],
+        row_index: int | None = None,
+    ) -> None:
+        if row_index is None:
+            match = _ROW_INDEX_RE.search(updated_range)
+            if not match:
+                logger.warning(
+                    "Could not determine the appended row number from '%s'; "
+                    "skipping rich-text formatting.",
+                    updated_range,
+                )
+                return
+            row_index = int(match.group(1))
+        self._apply_rich_text_to_row(row_index, plain_row, spans_by_column)
+
+    def _apply_rich_text_to_row(
+        self,
+        row_index: int,
         plain_row: list[str],
         spans_by_column: dict[int, list],
     ) -> None:
-        updated_range = append_result.get("updates", {}).get("updatedRange", "")
-        match = _ROW_INDEX_RE.search(updated_range)
-        if not match:
-            logger.warning(
-                "Could not determine the appended row number from '%s'; "
-                "skipping rich-text formatting.",
-                updated_range,
-            )
-            return
-        row_index = int(match.group(1))
-
         sheet_id = self._get_sheet_id(config.report_log_sheet_name)
 
         requests = []

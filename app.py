@@ -8,6 +8,7 @@ sheets (roster lookup + append) -> thread reply.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 
 from slack_bolt import App
@@ -29,6 +30,7 @@ from slack_handler import (
     get_file_links,
     is_ignorable_message,
     merge_demo_links,
+    parse_retry_command,
 )
 from text_cleanup import is_file_reference_only
 
@@ -38,6 +40,12 @@ logging.basicConfig(
 logger = logging.getLogger("weekly_importer")
 
 app = App(token=config.slack_bot_token)
+
+# In-flight imports keyed by (channel, parent thread_ts). Socket Mode runs
+# listeners on a thread pool, so a second "retry" while the first is still
+# running must not start another pipeline against the same message.
+_ACTIVE_IMPORTS: set[tuple[str, str]] = set()
+_ACTIVE_IMPORTS_LOCK = threading.Lock()
 
 
 def _message_datetime(event: dict) -> datetime:
@@ -68,6 +76,13 @@ def _build_skip_reply(enriched: EnrichedReport) -> str:
         ":information_source: Skipped *{name}* ({week}) -- already present in "
         "the *Report Log* (same ISO week + employee name)."
     ).format(name=enriched.employee_name, week=enriched.iso_year_week)
+
+
+def _build_replace_reply(enriched: EnrichedReport) -> str:
+    return (
+        ":arrows_counterclockwise: Replaced the existing row for "
+        f"*{enriched.employee_name}* ({enriched.iso_year_week})."
+    )
 
 
 def _file_label(file: dict) -> str:
@@ -228,23 +243,125 @@ def _enrich_report(
 
 
 @app.event("message")
-def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa: D401
+def handle_report_message(event: dict, say, client, context=None, **_kwargs) -> None:
     if is_ignorable_message(event):
+        return
+
+    bot_user_id = (context or {}).get("bot_user_id")
+    if bot_user_id and event.get("user") == bot_user_id:
         return
 
     if config.slack_channel_id and event.get("channel") != config.slack_channel_id:
         return
 
-    # Only treat top-level channel messages as new reports; ignore thread replies.
-    if event.get("thread_ts") and event.get("thread_ts") != event.get("ts"):
+    is_thread_reply = bool(
+        event.get("thread_ts") and event.get("thread_ts") != event.get("ts")
+    )
+    command = parse_retry_command(event.get("text"))
+
+    if is_thread_reply:
+        if command is None:
+            return
+        _handle_retry(event, say, client, force=command == "force")
         return
 
-    thread_ts = event.get("ts")
-    channel = event.get("channel", "?")
+    if command is not None:
+        say(
+            text=(
+                ":information_source: Reply `retry` in an import thread to "
+                "re-run that import. Use `retry force` to overwrite an "
+                "existing Report Log row."
+            ),
+            thread_ts=event.get("ts"),
+        )
+        return
+
+    _run_import(event, say, client, thread_ts=event.get("ts"))
+
+
+def _handle_retry(event: dict, say, client, *, force: bool) -> None:
+    """Fetch the thread parent and re-run the import against that message."""
+    thread_ts = event.get("thread_ts")
+    channel = event.get("channel")
+    try:
+        response = client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=1, inclusive=True
+        )
+    except Exception as exc:  # Slack SDK exception types vary by adapter
+        logger.warning("Retry: failed to fetch parent message: %s", exc)
+        say(
+            text=f":x: Could not fetch the original message to retry: {exc}",
+            thread_ts=thread_ts,
+        )
+        return
+
+    messages = response.get("messages") or []
+    parent = messages[0] if messages else None
+    if not isinstance(parent, dict) or parent.get("ts") != thread_ts:
+        say(
+            text=":x: Could not find the original message to retry.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    parent = dict(parent)
+    parent["channel"] = channel
+
+    if is_ignorable_message(parent):
+        say(
+            text=":x: The original message is a bot message and cannot be retried.",
+            thread_ts=thread_ts,
+        )
+        return
+    if parse_retry_command(parent.get("text")) is not None:
+        say(
+            text=(
+                ":x: The original message is itself a retry command and "
+                "cannot be retried."
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
     logger.info(
-        "=== Weekly report message received (channel=%s, ts=%s) ===",
+        "=== Retry requested (channel=%s, thread_ts=%s, force=%s) ===",
         channel,
         thread_ts,
+        force,
+    )
+    say(text=":arrows_counterclockwise: Retrying import...", thread_ts=thread_ts)
+    _run_import(parent, say, client, thread_ts=thread_ts, force=force)
+
+
+def _run_import(event: dict, say, client, *, thread_ts, force: bool = False) -> None:
+    """Extract reports from `event` and write them to the Report Log."""
+    channel = str(event.get("channel") or "?")
+    import_key = (channel, str(thread_ts or ""))
+    with _ACTIVE_IMPORTS_LOCK:
+        if import_key in _ACTIVE_IMPORTS:
+            say(
+                text=":hourglass: An import for this message is already running.",
+                thread_ts=thread_ts,
+            )
+            return
+        _ACTIVE_IMPORTS.add(import_key)
+
+    try:
+        _run_import_body(event, say, client, thread_ts=thread_ts, force=force)
+    finally:
+        with _ACTIVE_IMPORTS_LOCK:
+            _ACTIVE_IMPORTS.discard(import_key)
+
+
+def _run_import_body(
+    event: dict, say, client, *, thread_ts, force: bool = False
+) -> None:
+    channel = event.get("channel", "?")
+    logger.info(
+        "=== Weekly report message received (channel=%s, ts=%s, force=%s) ===",
+        channel,
+        thread_ts,
+        force,
     )
     reset_token_usage()
     sources, errors = _load_report_sources(event, client)
@@ -304,6 +421,7 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
 
     replies: list[str] = []
     saved_count = 0
+    replaced_count = 0
     skipped_count = 0
     for source_name, weekly_report in reports:
         try:
@@ -315,7 +433,17 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
             )
             enriched = _enrich_report(weekly_report, file_links)
             sheets_client = get_sheets_client()
-            if sheets_client.report_exists(
+            if force:
+                if sheets_client.replace_report(enriched):
+                    replaced_count += 1
+                    logger.info(
+                        "Replaced row for %s (%s)",
+                        enriched.employee_name,
+                        enriched.iso_year_week,
+                    )
+                    replies.append(_build_replace_reply(enriched))
+                    continue
+            elif sheets_client.report_exists(
                 enriched.iso_year_week, enriched.employee_name
             ):
                 skipped_count += 1
@@ -359,10 +487,11 @@ def handle_report_message(event: dict, say, client, **_kwargs) -> None:  # noqa:
         logger.info("Posting Slack thread reply (%d part(s))...", len(replies))
         say(text="\n\n".join(replies), thread_ts=thread_ts)
     logger.info(
-        "=== Message done (ts=%s): %d saved, %d skipped (duplicates), %d error(s), "
-        "%d total tokens used (prompt=%d, completion=%d) ===",
+        "=== Message done (ts=%s): %d saved, %d replaced, %d skipped (duplicates), "
+        "%d error(s), %d total tokens used (prompt=%d, completion=%d) ===",
         thread_ts,
         saved_count,
+        replaced_count,
         skipped_count,
         len(errors),
         usage.total_tokens,

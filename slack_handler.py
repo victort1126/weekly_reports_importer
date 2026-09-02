@@ -19,6 +19,11 @@ from file_ingest import is_supported_report_file
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://\S+")
+# Slack markup for users, channels, and special mentions such as <!here>.
+_MENTION_RE = re.compile(r"<[@#!][^>]+>")
+_TRAILING_BANG_RE = re.compile(r"[!！]+\s*$")
+_RETRY_WORDS = frozenset({"retry", "重试"})
+_FORCE_WORDS = frozenset({"force", "强制"})
 
 
 def is_ignorable_message(event: dict[str, Any]) -> bool:
@@ -29,6 +34,34 @@ def is_ignorable_message(event: dict[str, Any]) -> bool:
     if subtype in {"bot_message", "message_changed", "message_deleted", "channel_join"}:
         return True
     return False
+
+
+def parse_retry_command(text: str | None) -> str | None:
+    """Return ``"retry"`` or ``"force"`` when `text` is exactly a retry command.
+
+    Mentions such as ``<@U123>`` are stripped first. A trailing ``!`` / ``！``
+    or a following ``force`` / ``强制`` token means overwrite existing rows.
+    Longer sentences that merely contain the word "retry" return ``None`` so
+    ordinary thread chatter never re-runs an import.
+    """
+    if not text:
+        return None
+    stripped = _MENTION_RE.sub(" ", text).strip()
+    if not stripped:
+        return None
+
+    force_from_bang = bool(_TRAILING_BANG_RE.search(stripped))
+    stripped = _TRAILING_BANG_RE.sub("", stripped).strip()
+    tokens = stripped.split()
+    if not tokens:
+        return None
+    if tokens[0].casefold() not in _RETRY_WORDS:
+        return None
+    if len(tokens) == 1:
+        return "force" if force_from_bang else "retry"
+    if len(tokens) == 2 and tokens[1].casefold() in _FORCE_WORDS:
+        return "force"
+    return None
 
 
 def _extract_rich_text_elements(elements: list[dict[str, Any]]) -> str:

@@ -24,7 +24,8 @@ result to a "Report Log" tab.
    skipped (useful for accumulative multi-week workbooks).
 6. The bot replies in-thread with a summary (success) or an error message
    (failure) so you get immediate feedback, including the total Azure OpenAI
-   tokens used to process that message.
+   tokens used to process that message. Reply `retry` in that thread to re-run
+   the import, or `retry force` to overwrite an existing Report Log row.
 
 ## 1. Prerequisites
 
@@ -127,6 +128,21 @@ python app.py
 The app connects over Socket Mode (no public URL/firewall rule needed) and
 starts listening. Forward a report DM into the configured private channel to
 test it end-to-end; the bot will reply in-thread with the parsed result.
+
+### Retry a failed import
+
+If an import fails (or you need to re-run it after fixing the source), reply
+`retry` in that import's thread. The app fetches the original parent message
+and runs the same pipeline against it, then replies with the usual result.
+
+- `retry` still skips Report Log rows that already exist for the same ISO
+  week + employee name.
+- `retry force` (or `retry!`) overwrites the existing row in place instead of
+  skipping it. Use this when deleting a bad stub row first is not practical.
+
+The bot's own success/failure replies are ignored, so they cannot retrigger
+the import. No extra Slack scopes are needed: `groups:history` already covers
+`conversations.replies`.
 
 ### Supported report inputs
 
